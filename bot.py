@@ -1,4 +1,3 @@
-import httpx
 import random
 import string
 import re
@@ -13,6 +12,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from config import BOT_TOKEN
+import atomicmail_client as am
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,7 +20,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://api.mail.tm"
 user_sessions: dict[int, dict] = {}
 auto_fetch_jobs: dict[int, bool] = {}
 
@@ -29,44 +28,16 @@ def generate_random_username(length: int = 10) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
-def generate_random_password(length: int = 14) -> str:
-    chars = (
-        string.ascii_uppercase
-        + string.ascii_lowercase
-        + string.digits
-        + "!@#$%^&*"
-    )
-    return "".join(random.choices(chars, k=length))
-
-
-def extract_all_links(text: str) -> list[str]:
-    if not text:
-        return []
-    plain = html_mod.unescape(text)
-    raw_links = re.findall(r'(https?://[^\s<>"\']+)', plain)
-    cleaned = []
-    seen = set()
-    for link in raw_links:
-        link = link.rstrip('.,;:!?')
-        link = re.sub(r'[)}\]]+$', '', link)
-        if link not in seen:
-            seen.add(link)
-            cleaned.append(link)
-    return cleaned
-
-
 def extract_verification_code(text: str) -> str | None:
     if not text:
         return None
     plain = html_mod.unescape(text)
     lines = plain.split("\n")
-
     keywords = [
         "verification code", "your code", "code is", "code:",
         "enter code", "use code", "otp code",
         "کد تایید", "کد تأیید", "کد شما", "کد ورود",
     ]
-
     for line in lines:
         line = line.strip()
         if not line:
@@ -80,7 +51,6 @@ def extract_verification_code(text: str) -> str | None:
                 match = re.search(r"[:\s]+(\d{4,8})\s", line)
                 if match:
                     return match.group(1)
-
     for line in lines:
         line = line.strip()
         if not line:
@@ -88,26 +58,7 @@ def extract_verification_code(text: str) -> str | None:
         match = re.fullmatch(r"\s*(\d{4,8})\s*", line)
         if match:
             return match.group(1)
-
     return None
-
-
-def clean_link_description(line: str, link: str) -> str:
-    desc = line.replace(link, "").strip()
-    desc = re.sub(r'^[:\s\-–—]+', '', desc)
-    desc = re.sub(r'[.:;\s]+$', '', desc)
-    if len(desc) > 60:
-        desc = desc[:57] + "..."
-    if not desc:
-        if "delete" in link.lower():
-            desc = "🗑️ لینک حذف"
-        elif "verify" in link.lower() or "confirm" in link.lower():
-            desc = "✅ لینک تأیید"
-        elif "login" in link.lower() or "log" in link.lower():
-            desc = "🔑 لینک ورود"
-        else:
-            desc = "🔗 لینک"
-    return desc
 
 
 def extract_link_context(text: str) -> list[tuple[str, str]]:
@@ -117,7 +68,6 @@ def extract_link_context(text: str) -> list[tuple[str, str]]:
     lines = plain.split("\n")
     results = []
     seen = set()
-
     for line in lines:
         links_in_line = re.findall(r'(https?://[^\s<>"\']+)', line)
         for link in links_in_line:
@@ -126,76 +76,27 @@ def extract_link_context(text: str) -> list[tuple[str, str]]:
             if link in seen:
                 continue
             seen.add(link)
-            desc = clean_link_description(line, link)
+            desc = _clean_link_desc(line, link)
             results.append((desc, link))
-
     return results
 
 
-async def get_available_domains() -> list[str]:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{BASE_URL}/domains")
-        resp.raise_for_status()
-        data = resp.json()
-        return [item["domain"] for item in data.get("hydra:member", [])]
-
-
-async def create_mailtm_account(address: str, password: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{BASE_URL}/accounts",
-            json={"address": address, "password": password},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def get_mailtm_token(address: str, password: str) -> str:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{BASE_URL}/token",
-            json={"address": address, "password": password},
-        )
-        resp.raise_for_status()
-        return resp.json()["token"]
-
-
-async def get_messages(token: str) -> list[dict]:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{BASE_URL}/messages",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        resp.raise_for_status()
-        return resp.json().get("hydra:member", [])
-
-
-async def get_message_detail(token: str, msg_id: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{BASE_URL}/messages/{msg_id}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def delete_account(token: str) -> bool:
-    async with httpx.AsyncClient() as client:
-        resp_me = await client.get(
-            f"{BASE_URL}/me",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if resp_me.status_code != 200:
-            return False
-        account_id = resp_me.json().get("id")
-        if not account_id:
-            return False
-        resp = await client.delete(
-            f"{BASE_URL}/accounts/{account_id}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        return resp.status_code == 204
+def _clean_link_desc(line: str, link: str) -> str:
+    desc = line.replace(link, "").strip()
+    desc = re.sub(r'^[:\s\-–—]+', '', desc)
+    desc = re.sub(r'[.:;\s]+$', '', desc)
+    if len(desc) > 60:
+        desc = desc[:57] + "..."
+    if not desc:
+        ll = link.lower()
+        if "delete" in ll:
+            return "🗑️ لینک حذف"
+        elif "verify" in ll or "confirm" in ll:
+            return "✅ لینک تأیید"
+        elif "login" in ll or "log" in ll:
+            return "🔑 لینک ورود"
+        return "🔗 لینک"
+    return desc
 
 
 def get_session(chat_id: int) -> dict | None:
@@ -221,22 +122,21 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗑️ حذف ایمیل", callback_data="delete"),
         ],
         [
-            InlineKeyboardButton("🌐 دامنه‌ها", callback_data="domains"),
             InlineKeyboardButton("📖 راهنما", callback_data="help"),
         ],
     ])
 
 
-WELCOME_MSG = """🎯 ربات ایمیل موقت حرفه‌ای
+WELCOME_MSG = """🎯 ربات ایمیل موقت حرفه‌ای (Atomic Mail)
 
-✨ با این ربات می‌توانید ایمیل موقت رایگان بسازید
+✨ با این ربات می‌توانید ایمیل واقعی رایگان بسازید
 و برای ثبت‌نام در سایت‌ها استفاده کنید.
 
 🔒 ویژگی‌ها:
+  • ایمیل واقعی @atomicmail.ai
   • دریافت خودکار ایمیل تأیید
   • نمایش تمام لینک‌های ایمیل
-  • دامنه‌های متنوع
-  • اعتبار ۷ روزه
+  • تشخیص خودکار کد تأیید
 
 📋 منوی اصلی:"""
 
@@ -249,11 +149,10 @@ HELP_MSG = """📖 راهنمای ربات
 🔹 /read <شماره> - خواندن ایمیل خاص
 🔹 /password - نمایش رمز عبور
 🔹 /delete - حذف ایمیل فعلی
-🔹 /domains - لیست دامنه‌ها
 🔹 /stop - توقف دریافت خودکار
 
-💡 نکته: بعد از دریافت ایمیل، تمام لینک‌ها
-نمایش داده می‌شوند تا خودتان انتخاب کنید."""
+💡 نکته: ایمیل‌ها خودکار بررسی می‌شوند.
+کد تأیید و لینک‌ها خودکار شناسایی می‌شوند."""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,43 +184,28 @@ async def show_creation_status(update, chat_id):
     status_msg = await update.message.reply_text("⏳ در حال ساخت ایمیل موقت...")
     try:
         username = generate_random_username()
-        password = generate_random_password()
-        domains = await get_available_domains()
-        if not domains:
-            await status_msg.edit_text(
-                "❌ خطا: دامنه‌ای موجود نیست.",
-                reply_markup=build_main_menu_keyboard(),
-            )
-            return
-        domain = random.choice(domains)
-        address = f"{username}@{domain}"
-        await create_mailtm_account(address, password)
-        token = await get_mailtm_token(address, password)
+        logger.info(f"Registering new account: {username}")
+        creds = await am.register(username)
         set_session(chat_id, {
-            "address": address,
-            "password": password,
-            "token": token,
+            "address": creds["address"],
+            "api_key": creds["api_key"],
+            "account_id": creds["account_id"],
             "username": username,
-            "domain": domain,
             "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{address}</code>\n\n"
-            f"🔑 رمز:\n<code>{password}</code>\n\n"
-            "⏰ اعتبار: ۷ روز\n"
+            f"📧 آدرس:\n<code>{creds['address']}</code>\n\n"
+            "⏰ اعتبار: دائمی\n"
             "🔄 دریافت خودکار: فعال\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📌 در سایت ثبت‌نام کنید.\n"
             "ایمیل‌ها خودکار بررسی می‌شوند."
         )
         keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
-                InlineKeyboardButton("📋 کپی رمز", callback_data="copy_pass"),
-            ],
+            [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
             [
                 InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
                 InlineKeyboardButton("🗑️ حذف", callback_data="delete"),
@@ -357,38 +241,35 @@ async def custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not all(c.isalnum() or c in "-_." for c in custom_username):
         await update.message.reply_text("❌ نام نامعتبر است.", reply_markup=build_main_menu_keyboard())
         return
+    if len(custom_username) < 5 or len(custom_username) > 21:
+        await update.message.reply_text(
+            "❌ نام باید بین ۵ تا ۲۱ کاراکتر باشد.",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
     status_msg = await update.message.reply_text("⏳ در حال ساخت ایمیل...")
     try:
-        password = generate_random_password()
-        domains = await get_available_domains()
-        if not domains:
-            await status_msg.edit_text("❌ خطا: دامنه‌ای موجود نیست.", reply_markup=build_main_menu_keyboard())
-            return
-        domain = random.choice(domains)
-        address = f"{custom_username}@{domain}"
-        await create_mailtm_account(address, password)
-        token = await get_mailtm_token(address, password)
+        creds = await am.register(custom_username)
         set_session(chat_id, {
-            "address": address, "password": password, "token": token,
-            "username": custom_username, "domain": domain, "message_count": 0,
+            "address": creds["address"],
+            "api_key": creds["api_key"],
+            "account_id": creds["account_id"],
+            "username": custom_username,
+            "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{address}</code>\n\n"
-            f"🔑 رمز:\n<code>{password}</code>\n\n"
-            "⏰ اعتبار: ۷ روز\n"
+            f"📧 آدرس:\n<code>{creds['address']}</code>\n\n"
+            "⏰ اعتبار: دائمی\n"
             "🔄 دریافت خودکار: فعال\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📌 در سایت ثبت‌نام کنید.\n"
             "ایمیل‌ها خودکار بررسی می‌شوند."
         )
         keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
-                InlineKeyboardButton("📋 کپی رمز", callback_data="copy_pass"),
-            ],
+            [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
             [
                 InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
                 InlineKeyboardButton("🗑️ حذف", callback_data="delete"),
@@ -415,7 +296,7 @@ async def show_inbox(update_or_query, chat_id, session):
     else:
         msg = await update_or_query.edit_message_text("⏳ در حال بررسی صندوق...")
     try:
-        messages = await get_messages(session["token"])
+        messages = await am.get_messages(session["username"], session["account_id"])
         if not messages:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
@@ -435,9 +316,9 @@ async def show_inbox(update_or_query, chat_id, session):
             lines.insert(0, f"🔔 {new_count} ایمیل جدید!\n")
         buttons = []
         for i, m in enumerate(messages[:10], 1):
-            sender = m.get("from", {}).get("address", "ناشناس")
+            sender = am.extract_sender(m)
             subject = m.get("subject", "(بدون موضوع)")
-            created = m.get("createdAt", "")[:10]
+            created = m.get("receivedAt", "")[:10]
             lines.append(f"{i}. 📩 {subject}\n   👤 {sender} | 📅 {created}")
             buttons.append([InlineKeyboardButton(f"📩 {subject[:35]}", callback_data=f"read_{i-1}")])
         buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
@@ -459,15 +340,15 @@ async def read(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         msg_index = int(context.args[0]) - 1
-        messages = await get_messages(session["token"])
+        messages = await am.get_messages(session["username"], session["account_id"])
         if not messages:
             await update.message.reply_text("📭 صندوق خالی است.")
             return
         if msg_index < 0 or msg_index >= len(messages):
             await update.message.reply_text(f"❌ شماره ۱ تا {len(messages)}")
             return
-        msg_id = messages[msg_index]["id"]
-        detail = await get_message_detail(session["token"], msg_id)
+        email_id = messages[msg_index]["id"]
+        detail = await am.get_email_detail(session["username"], session["account_id"], email_id)
         await show_email_detail(update, detail)
     except ValueError:
         await update.message.reply_text("❌ شماره نامعتبر.")
@@ -476,10 +357,10 @@ async def read(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_email_detail(update_or_query, detail):
-    sender = detail.get("from", {}).get("address", "ناشناس")
+    sender = am.extract_sender(detail)
     subject = detail.get("subject", "(بدون موضوع)")
-    text = detail.get("text") or detail.get("html") or ""
-    created = detail.get("createdAt", "")[:16].replace("T", " ")
+    text = am.extract_text_from_email(detail)
+    created = detail.get("receivedAt", "")[:16].replace("T", " ")
 
     code = extract_verification_code(text)
     links = extract_link_context(text)
@@ -536,10 +417,12 @@ async def password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔑 رمز ایمیل شما\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📧 آدرس:\n<code>{session['address']}</code>\n\n"
-        f"🔑 رمز:\n<code>{session['password']}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💡 ایمیل @atomicmail.ai نیاز به رمز جداگانه ندارد.\n"
+        "فقط آدرس ایمیل را کپی کنید."
     )
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
         [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
     ])
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
@@ -563,26 +446,6 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("⏳ دریافت دامنه‌ها...")
-    try:
-        domain_list = await get_available_domains()
-        if not domain_list:
-            await status_msg.edit_text("❌ دامنه‌ای نیست.", reply_markup=build_main_menu_keyboard())
-            return
-        msg = "🌐 دامنه‌ها\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        for i, d in enumerate(domain_list, 1):
-            msg += f"  {i}. {d}\n"
-        msg += f"\n━━━━━━━━━━━━━━━━━━━━\n📊 مجموع: {len(domain_list)}"
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📧 ساخت ایمیل", callback_data="newmail")],
-            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
-        ])
-        await status_msg.edit_text(msg, reply_markup=keyboard)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
-
-
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     auto_fetch_jobs[chat_id] = False
@@ -598,17 +461,17 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
             auto_fetch_jobs.pop(chat_id, None)
             continue
         try:
-            messages = await get_messages(session["token"])
+            messages = await am.get_messages(session["username"], session["account_id"])
             current_count = len(messages)
             last_count = session.get("message_count", 0)
             if current_count > last_count:
                 new_messages = messages[:current_count - last_count]
                 session["message_count"] = current_count
                 for m in new_messages:
-                    sender = m.get("from", {}).get("address", "ناشناس")
+                    sender = am.extract_sender(m)
                     subject = m.get("subject", "(بدون موضوع)")
-                    detail = await get_message_detail(session["token"], m["id"])
-                    text = detail.get("text") or detail.get("html") or ""
+                    detail = await am.get_email_detail(session["username"], session["account_id"], m["id"])
+                    text = am.extract_text_from_email(detail)
                     code = extract_verification_code(text)
                     links = extract_link_context(text)
 
@@ -678,10 +541,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "delete_and_new":
         session = get_session(chat_id)
         if session:
-            try:
-                await delete_account(session["token"])
-            except Exception:
-                pass
             clear_session(chat_id)
             auto_fetch_jobs.pop(chat_id, None)
         await show_creation_status_from_callback(query, chat_id)
@@ -694,11 +553,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ ایمیلی نیست", show_alert=True)
 
     elif data == "copy_pass":
-        session = get_session(chat_id)
-        if session:
-            await query.answer(f"🔑 {session['password']}", show_alert=True)
-        else:
-            await query.answer("⚠️ ایمیلی نیست", show_alert=True)
+        await query.answer("💡 ایمیل @atomicmail.ai نیاز به رمز ندارد.", show_alert=True)
 
     elif data == "cancel":
         await query.edit_message_text("✅ لغو شد.", reply_markup=build_main_menu_keyboard())
@@ -706,10 +561,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "confirm_delete":
         session = get_session(chat_id)
         if session:
-            try:
-                await delete_account(session["token"])
-            except Exception:
-                pass
             clear_session(chat_id)
             auto_fetch_jobs.pop(chat_id, None)
             await query.edit_message_text("✅ حذف شد.", reply_markup=build_main_menu_keyboard())
@@ -729,11 +580,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not session:
                 await query.edit_message_text("⚠️ ایمیل فعالی ندارید.")
                 return
-            messages = await get_messages(session["token"])
+            messages = await am.get_messages(session["username"], session["account_id"])
             if not messages:
                 await query.edit_message_text("📭 خالی.")
                 return
-            detail = await get_message_detail(session["token"], messages[0]["id"])
+            detail = await am.get_email_detail(session["username"], session["account_id"], messages[0]["id"])
             await show_email_detail_from_callback(query, detail)
         else:
             msg_index = int(data.split("_")[1])
@@ -742,11 +593,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ ایمیل فعالی ندارید.")
                 return
             try:
-                messages = await get_messages(session["token"])
+                messages = await am.get_messages(session["username"], session["account_id"])
                 if msg_index >= len(messages):
                     await query.edit_message_text("❌ یافت نشد.")
                     return
-                detail = await get_message_detail(session["token"], messages[msg_index]["id"])
+                detail = await am.get_email_detail(session["username"], session["account_id"], messages[msg_index]["id"])
                 await show_email_detail_from_callback(query, detail)
             except Exception as e:
                 await query.edit_message_text(f"❌ خطا: {str(e)}")
@@ -765,24 +616,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await show_inbox_from_callback(query, chat_id, session)
 
-    elif data == "domains":
-        try:
-            domain_list = await get_available_domains()
-            if not domain_list:
-                await query.edit_message_text("❌ دامنه‌ای نیست.", reply_markup=build_main_menu_keyboard())
-                return
-            msg = "🌐 دامنه‌ها\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            for i, d in enumerate(domain_list, 1):
-                msg += f"  {i}. {d}\n"
-            msg += f"\n━━━━━━━━━━━━━━━━━━━━\n📊 مجموع: {len(domain_list)}"
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📧 ساخت ایمیل", callback_data="newmail")],
-                [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
-            ])
-            await query.edit_message_text(msg, reply_markup=keyboard)
-        except Exception as e:
-            await query.edit_message_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
-
     elif data == "stop":
         auto_fetch_jobs[chat_id] = False
         await query.edit_message_text("✅ متوقف شد.", reply_markup=build_main_menu_keyboard())
@@ -792,36 +625,28 @@ async def show_creation_status_from_callback(query, chat_id):
     status_msg = await query.edit_message_text("⏳ در حال ساخت ایمیل...")
     try:
         username = generate_random_username()
-        password = generate_random_password()
-        domains = await get_available_domains()
-        if not domains:
-            await status_msg.edit_text("❌ دامنه‌ای نیست.", reply_markup=build_main_menu_keyboard())
-            return
-        domain = random.choice(domains)
-        address = f"{username}@{domain}"
-        await create_mailtm_account(address, password)
-        token = await get_mailtm_token(address, password)
+        logger.info(f"Registering new account from callback: {username}")
+        creds = await am.register(username)
         set_session(chat_id, {
-            "address": address, "password": password, "token": token,
-            "username": username, "domain": domain, "message_count": 0,
+            "address": creds["address"],
+            "api_key": creds["api_key"],
+            "account_id": creds["account_id"],
+            "username": username,
+            "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{address}</code>\n\n"
-            f"🔑 رمز:\n<code>{password}</code>\n\n"
-            "⏰ اعتبار: ۷ روز\n"
+            f"📧 آدرس:\n<code>{creds['address']}</code>\n\n"
+            "⏰ اعتبار: دائمی\n"
             "🔄 دریافت خودکار: فعال\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📌 در سایت ثبت‌نام کنید.\n"
             "ایمیل‌ها خودکار بررسی می‌شوند."
         )
         keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
-                InlineKeyboardButton("📋 کپی رمز", callback_data="copy_pass"),
-            ],
+            [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
             [
                 InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
                 InlineKeyboardButton("🗑️ حذف", callback_data="delete"),
@@ -835,7 +660,7 @@ async def show_creation_status_from_callback(query, chat_id):
 async def show_inbox_from_callback(query, chat_id, session):
     await query.edit_message_text("⏳ در حال بررسی...")
     try:
-        messages = await get_messages(session["token"])
+        messages = await am.get_messages(session["username"], session["account_id"])
         if not messages:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
@@ -852,9 +677,9 @@ async def show_inbox_from_callback(query, chat_id, session):
             lines.insert(0, f"🔔 {new_count} جدید!\n")
         buttons = []
         for i, m in enumerate(messages[:10], 1):
-            sender = m.get("from", {}).get("address", "ناشناس")
+            sender = am.extract_sender(m)
             subject = m.get("subject", "(بدون موضوع)")
-            created = m.get("createdAt", "")[:10]
+            created = m.get("receivedAt", "")[:10]
             lines.append(f"{i}. 📩 {subject}\n   👤 {sender} | 📅 {created}")
             buttons.append([InlineKeyboardButton(f"📩 {subject[:35]}", callback_data=f"read_{i-1}")])
         buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
@@ -865,10 +690,10 @@ async def show_inbox_from_callback(query, chat_id, session):
 
 
 async def show_email_detail_from_callback(query, detail):
-    sender = detail.get("from", {}).get("address", "ناشناس")
+    sender = am.extract_sender(detail)
     subject = detail.get("subject", "(بدون موضوع)")
-    text = detail.get("text") or detail.get("html") or ""
-    created = detail.get("createdAt", "")[:16].replace("T", " ")
+    text = am.extract_text_from_email(detail)
+    created = detail.get("receivedAt", "")[:16].replace("T", " ")
 
     code = extract_verification_code(text)
     links = extract_link_context(text)
@@ -918,7 +743,6 @@ def main():
     app.add_handler(CommandHandler("read", read))
     app.add_handler(CommandHandler("password", password))
     app.add_handler(CommandHandler("delete", delete))
-    app.add_handler(CommandHandler("domains", domains))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CallbackQueryHandler(callback_handler))
 

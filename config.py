@@ -1,3 +1,5 @@
 import os
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8927705499:AAFy6rRsIgN-Gs_7fsaEiI94qgllkjKYkW4")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is not set!")
