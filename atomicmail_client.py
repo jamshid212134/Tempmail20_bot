@@ -59,6 +59,63 @@ def solve_pow(challenge: str, difficulty: int, salt: str) -> tuple[str, str]:
             logger.info(f"PoW progress: nonce={nonce}")
 
 
+async def _do_challenge_pow_and_session(http_client, *, api_key=None, username=None):
+    resp = await http_client.post(f"{AUTH_URL}/api/v1/challenge")
+    if resp.status_code != 200:
+        raise ValueError(f"Challenge request failed: {resp.status_code} {resp.text}")
+
+    challenge_jwt = None
+    auth_header = resp.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        challenge_jwt = auth_header[7:].strip()
+    if not challenge_jwt:
+        raise ValueError("No challenge JWT in response")
+
+    payload = _decode_jwt_payload(challenge_jwt)
+    challenge = payload.get("jti")
+    difficulty = payload.get("difficulty")
+    salt = payload.get("salt", DEFAULT_SCRYPT_SALT)
+    if not challenge or not difficulty:
+        raise ValueError(f"Malformed challenge payload: {payload}")
+
+    logger.info(f"Solving PoW (difficulty={difficulty})...")
+    pow_hex, nonce = solve_pow(challenge, int(difficulty), salt)
+    logger.info(f"PoW solved! nonce={nonce}")
+
+    body = {"powHex": pow_hex, "nonce": nonce}
+    if api_key:
+        body["apiKey"] = api_key
+    if username:
+        body["username"] = username
+
+    resp = await http_client.post(
+        f"{AUTH_URL}/api/v1/session",
+        headers={"Authorization": f"Bearer {challenge_jwt}"},
+        json=body,
+    )
+    if resp.status_code != 200:
+        error_data = {}
+        try:
+            error_data = resp.json()
+        except Exception:
+            pass
+        hint = error_data.get("error", {}).get("hint", "")
+        raise ValueError(f"Session exchange failed: {resp.status_code} {resp.text} {hint}")
+
+    session_jwt = None
+    auth_header = resp.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        session_jwt = auth_header[7:].strip()
+
+    resp_data = resp.json() if resp.text.strip() else {}
+    returned_api_key = resp_data.get("apiKey")
+
+    if not session_jwt:
+        raise ValueError("No session JWT in response")
+
+    return session_jwt, returned_api_key or api_key
+
+
 class AtomicMailClient:
     def __init__(self):
         self._http = httpx.AsyncClient(timeout=120)
@@ -68,138 +125,100 @@ class AtomicMailClient:
         self._api_key: str | None = None
         self._account_id: str | None = None
         self._address: str | None = None
+        self._username: str | None = None
 
     async def close(self):
         await self._http.aclose()
 
     async def register(self, username: str) -> dict:
-        logger.info(f"Requesting challenge for {username}...")
-        resp = await self._http.post(f"{AUTH_URL}/api/v1/challenge")
-        if resp.status_code != 200:
-            raise ValueError(f"Challenge request failed: {resp.status_code} {resp.text}")
+        logger.info(f"Registering new account: {username}")
 
-        challenge_jwt = None
-        auth_header = resp.headers.get("authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            challenge_jwt = auth_header[7:].strip()
-
-        if not challenge_jwt:
-            raise ValueError("No challenge JWT in response")
-
-        payload = _decode_jwt_payload(challenge_jwt)
-        challenge = payload.get("jti")
-        difficulty = payload.get("difficulty")
-        salt = payload.get("salt", DEFAULT_SCRYPT_SALT)
-
-        if not challenge or not difficulty:
-            raise ValueError(f"Malformed challenge payload: {payload}")
-
-        logger.info(f"Solving PoW (difficulty={difficulty})...")
-        pow_hex, nonce = solve_pow(challenge, int(difficulty), salt)
-        logger.info(f"PoW solved! nonce={nonce}")
-
-        resp = await self._http.post(
-            f"{AUTH_URL}/api/v1/session",
-            headers={"Authorization": f"Bearer {challenge_jwt}"},
-            json={"powHex": pow_hex, "nonce": nonce, "username": username},
+        session_jwt, api_key = await _do_challenge_pow_and_session(
+            self._http, username=username
         )
-        if resp.status_code != 200:
-            error_data = {}
-            try:
-                error_data = resp.json()
-            except Exception:
-                pass
-            hint = error_data.get("error", {}).get("hint", "")
-            raise ValueError(f"Session exchange failed: {resp.status_code} {resp.text} {hint}")
-
-        session_jwt = None
-        auth_header = resp.headers.get("authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            session_jwt = auth_header[7:].strip()
-
-        resp_data = resp.json() if resp.text.strip() else {}
-        api_key = resp_data.get("apiKey")
-
-        if not session_jwt:
-            raise ValueError("No session JWT in response")
 
         self._session_jwt = session_jwt
         self._api_key = api_key
+        self._username = username
         self._address = f"{username}@atomicmail.ai"
 
         await self._refresh_capability()
 
-        session_payload = _decode_jwt_payload(session_jwt)
-        self._account_id = (
-            session_payload.get("accountId")
-            or session_payload.get("sub")
-        )
-
-        if not self._account_id or self._account_id in ("session", "challenge"):
+        self._account_id = self._extract_account_id(session_jwt)
+        if not self._account_id:
             self._account_id = await self._resolve_account_id()
 
-        CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
-        creds = {
+        self._save_credentials()
+
+        return {
             "username": username,
             "address": self._address,
             "api_key": api_key,
             "account_id": self._account_id,
-            "session_jwt": session_jwt,
         }
+
+    async def restore_from_saved(self) -> bool:
+        if not self._username or not self._api_key:
+            return False
+
+        logger.info(f"Restoring session for {self._username}...")
+        try:
+            session_jwt, _ = await _do_challenge_pow_and_session(
+                self._http, api_key=self._api_key
+            )
+            self._session_jwt = session_jwt
+
+            await self._refresh_capability()
+
+            self._account_id = self._extract_account_id(session_jwt)
+            if not self._account_id:
+                self._account_id = self._account_id_from_creds or await self._resolve_account_id()
+
+            logger.info(f"Session restored for {self._username}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restore session for {self._username}: {e}")
+            return False
+
+    _account_id_from_creds: str | None = None
+
+    def load_from_disk(self, username: str) -> bool:
         cred_file = CREDENTIALS_DIR / f"{username}.json"
+        if not cred_file.exists():
+            return False
+        try:
+            data = json.loads(cred_file.read_text())
+            self._username = data.get("username", username)
+            self._api_key = data.get("api_key")
+            self._address = data.get("address")
+            self._account_id = data.get("account_id")
+            self._account_id_from_creds = self._account_id
+            return bool(self._api_key)
+        except Exception as e:
+            logger.error(f"Failed to load credentials for {username}: {e}")
+            return False
+
+    def _extract_account_id(self, session_jwt: str) -> str | None:
+        try:
+            payload = _decode_jwt_payload(session_jwt)
+            account_id = payload.get("accountId") or payload.get("sub")
+            if account_id and account_id not in ("session", "challenge"):
+                return account_id
+        except Exception:
+            pass
+        return None
+
+    def _save_credentials(self):
+        CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        creds = {
+            "username": self._username,
+            "address": self._address,
+            "api_key": self._api_key,
+            "account_id": self._account_id,
+            "session_jwt": self._session_jwt,
+        }
+        cred_file = CREDENTIALS_DIR / f"{self._username}.json"
         cred_file.write_text(json.dumps(creds, indent=2))
-
-        return creds
-
-    async def login_with_api_key(self, api_key: str, username: str) -> dict:
-        self._api_key = api_key
-        self._address = f"{username}@atomicmail.ai"
-
-        logger.info(f"Logging in with API key for {username}...")
-
-        resp = await self._http.post(f"{AUTH_URL}/api/v1/challenge")
-        if resp.status_code != 200:
-            raise ValueError(f"Challenge request failed: {resp.status_code}")
-
-        challenge_jwt = None
-        auth_header = resp.headers.get("authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            challenge_jwt = auth_header[7:].strip()
-
-        payload = _decode_jwt_payload(challenge_jwt)
-        challenge = payload.get("jti")
-        difficulty = payload.get("difficulty")
-        salt = payload.get("salt", DEFAULT_SCRYPT_SALT)
-
-        pow_hex, nonce = solve_pow(challenge, int(difficulty), salt)
-
-        resp = await self._http.post(
-            f"{AUTH_URL}/api/v1/session",
-            headers={"Authorization": f"Bearer {challenge_jwt}"},
-            json={"powHex": pow_hex, "nonce": nonce, "apiKey": api_key},
-        )
-        if resp.status_code != 200:
-            raise ValueError(f"Session exchange failed: {resp.status_code} {resp.text}")
-
-        session_jwt = None
-        auth_header = resp.headers.get("authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            session_jwt = auth_header[7:].strip()
-
-        self._session_jwt = session_jwt
-
-        await self._refresh_capability()
-
-        session_payload = _decode_jwt_payload(session_jwt)
-        self._account_id = (
-            session_payload.get("accountId")
-            or session_payload.get("sub")
-        )
-
-        if not self._account_id or self._account_id in ("session", "challenge"):
-            self._account_id = await self._resolve_account_id()
-
-        return {"username": username, "address": self._address, "api_key": api_key, "account_id": self._account_id}
 
     async def _refresh_capability(self):
         if not self._session_jwt:
@@ -227,14 +246,12 @@ class AtomicMailClient:
         if not self._capability_jwt or time.time() >= self._capability_expires:
             await self._refresh_capability()
 
+    async def _ensure_session(self):
+        if not self._session_jwt:
+            await self.restore_from_saved()
+
     async def _resolve_account_id(self) -> str:
         await self._ensure_capability()
-        result = await self.jmap_request([
-            ["Email/query", {"accountId": "$$first", "limit": 1}, "q0"]
-        ])
-        for item in result.get("methodResponses", []):
-            if item[0] == "error":
-                continue
         resp = await self._http.post(
             f"{API_URL}/jmap",
             headers={"Authorization": f"Bearer {self._capability_jwt}"},
@@ -253,6 +270,7 @@ class AtomicMailClient:
         return ""
 
     async def jmap_request(self, ops: list) -> dict:
+        await self._ensure_session()
         await self._ensure_capability()
         resp = await self._http.post(
             f"{API_URL}/jmap",
@@ -339,31 +357,35 @@ class AtomicMailClient:
 _clients: dict[str, AtomicMailClient] = {}
 
 
-def get_client(username: str) -> AtomicMailClient:
-    if username not in _clients:
-        _clients[username] = AtomicMailClient()
-    return _clients[username]
+async def get_client(username: str) -> AtomicMailClient:
+    if username in _clients:
+        return _clients[username]
 
-
-def get_client_by_address(address: str) -> AtomicMailClient | None:
-    for uname, client in _clients.items():
-        if client._address == address:
+    client = AtomicMailClient()
+    if client.load_from_disk(username):
+        restored = await client.restore_from_saved()
+        if restored:
+            _clients[username] = client
             return client
-    return None
+
+    _clients[username] = client
+    return client
 
 
 async def register(username: str) -> dict:
-    client = get_client(username)
-    return await client.register(username)
+    client = AtomicMailClient()
+    result = await client.register(username)
+    _clients[username] = client
+    return result
 
 
 async def get_messages(username: str, account_id: str) -> list:
-    client = get_client(username)
+    client = await get_client(username)
     return await client.get_messages(account_id)
 
 
 async def get_email_detail(username: str, account_id: str, email_id: str) -> dict:
-    client = get_client(username)
+    client = await get_client(username)
     return await client.get_email_detail(account_id, email_id)
 
 

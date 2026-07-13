@@ -2,8 +2,10 @@ import random
 import string
 import re
 import logging
+import json
 import html as html_mod
 from datetime import datetime
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -111,6 +113,31 @@ def clear_session(chat_id: int):
     user_sessions.pop(chat_id, None)
 
 
+_CHAT_IDS_FILE = Path.home() / ".atomicmail" / "chat_ids.json"
+
+
+def _save_chat_id(username: str, chat_id: int):
+    _CHAT_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if _CHAT_IDS_FILE.exists():
+        try:
+            data = json.loads(_CHAT_IDS_FILE.read_text())
+        except Exception:
+            pass
+    data[str(chat_id)] = username
+    _CHAT_IDS_FILE.write_text(json.dumps(data))
+
+
+def _load_chat_ids() -> dict[int, str]:
+    if not _CHAT_IDS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(_CHAT_IDS_FILE.read_text())
+        return {int(k): v for k, v in data.items()}
+    except Exception:
+        return {}
+
+
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -150,6 +177,7 @@ HELP_MSG = """📖 راهنمای ربات
 🔹 /password - نمایش رمز عبور
 🔹 /delete - حذف ایمیل فعلی
 🔹 /stop - توقف دریافت خودکار
+🔹 /restart - راه‌اندازی مجدد خودکار
 
 💡 نکته: ایمیل‌ها خودکار بررسی می‌شوند.
 کد تأیید و لینک‌ها خودکار شناسایی می‌شوند."""
@@ -194,6 +222,7 @@ async def show_creation_status(update, chat_id):
             "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
+        _save_chat_id(username, chat_id)
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -254,10 +283,11 @@ async def custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "address": creds["address"],
             "api_key": creds["api_key"],
             "account_id": creds["account_id"],
-            "username": custom_username,
+            "username": username,
             "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
+        _save_chat_id(username, chat_id)
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -452,6 +482,29 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ دریافت خودکار متوقف شد.", reply_markup=build_main_menu_keyboard())
 
 
+async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = get_session(chat_id)
+    if not session:
+        await update.message.reply_text(
+            "⚠️ ایمیل فعالی ندارید. ابتدا /newmail بزنید.",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+    auto_fetch_jobs[chat_id] = True
+    try:
+        messages = await am.get_messages(session["username"], session["account_id"])
+        session["message_count"] = len(messages)
+    except Exception:
+        pass
+    await update.message.reply_text(
+        "✅ دریافت خودکار فعال شد!\n"
+        f"📧 {session['address']}\n"
+        "🔄 هر ۱۰ ثانیه صندوق بررسی می‌شود.",
+        reply_markup=build_main_menu_keyboard(),
+    )
+
+
 async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
     for chat_id, is_active in list(auto_fetch_jobs.items()):
         if not is_active:
@@ -460,17 +513,29 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
         if not session:
             auto_fetch_jobs.pop(chat_id, None)
             continue
+        username = session.get("username")
+        account_id = session.get("account_id")
+        if not username or not account_id:
+            logger.warning(f"Auto-check: no username/account_id for chat {chat_id}")
+            continue
         try:
-            messages = await am.get_messages(session["username"], session["account_id"])
+            messages = await am.get_messages(username, account_id)
             current_count = len(messages)
             last_count = session.get("message_count", 0)
+
+            if last_count == 0 and current_count > 0:
+                session["message_count"] = current_count
+                logger.info(f"Auto-check: initialized count={current_count} for {username}")
+                continue
+
             if current_count > last_count:
                 new_messages = messages[:current_count - last_count]
                 session["message_count"] = current_count
+                logger.info(f"Auto-check: {len(new_messages)} new emails for {username}")
                 for m in new_messages:
                     sender = am.extract_sender(m)
                     subject = m.get("subject", "(بدون موضوع)")
-                    detail = await am.get_email_detail(session["username"], session["account_id"], m["id"])
+                    detail = await am.get_email_detail(username, account_id, m["id"])
                     text = am.extract_text_from_email(detail)
                     code = extract_verification_code(text)
                     links = extract_link_context(text)
@@ -506,8 +571,10 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup(buttons),
                     )
+            else:
+                logger.debug(f"Auto-check: no new emails for {username} (count={current_count})")
         except Exception as e:
-            logger.error(f"Auto-check error: {e}")
+            logger.error(f"Auto-check error for {username}: {e}", exc_info=True)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -635,6 +702,7 @@ async def show_creation_status_from_callback(query, chat_id):
             "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
+        _save_chat_id(username, chat_id)
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -744,14 +812,38 @@ def main():
     app.add_handler(CommandHandler("password", password))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("restart", restart))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     job_queue = app.job_queue
     job_queue.run_repeating(auto_check_inbox, interval=10, first=5)
+    job_queue.run_once(_startup_restore, 1)
 
     logger.info("🚀 ربات شروع به کار کرد!")
     print("✅ ربات در حال اجراست...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+async def _startup_restore(context: ContextTypes.DEFAULT_TYPE):
+    chat_id_map = _load_chat_ids()
+    if not chat_id_map:
+        logger.info("No saved chat IDs to restore")
+        return
+    for chat_id, username in chat_id_map.items():
+        try:
+            client = await am.get_client(username)
+            if client._account_id:
+                set_session(chat_id, {
+                    "address": f"{username}@atomicmail.ai",
+                    "api_key": client._api_key,
+                    "account_id": client._account_id,
+                    "username": username,
+                    "message_count": 0,
+                })
+                auto_fetch_jobs[chat_id] = True
+                logger.info(f"Restored auto-check for {username} (chat={chat_id})")
+        except Exception as e:
+            logger.error(f"Failed to restore {username}: {e}")
 
 
 if __name__ == "__main__":
