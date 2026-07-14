@@ -1,6 +1,4 @@
 import httpx
-import random
-import string
 import re
 import logging
 import html as html_mod
@@ -25,15 +23,6 @@ auto_fetch_jobs: dict[int, bool] = {}
 
 # ─── Helpers ───────────────────────────────────────────
 
-def generate_username(length=10):
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
-
-
-def generate_password(length=14):
-    chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%"
-    return "".join(random.choices(chars, k=length))
-
-
 def extract_code(text):
     if not text:
         return None
@@ -41,7 +30,8 @@ def extract_code(text):
     keywords = [
         "verification code", "your code", "code is", "code:",
         "enter code", "use code", "otp", "launch code", "pin",
-        "کد تایید", "کد تأیید", "کد شما", "کد ورود",
+        "verify", "confirmation", "confirm",
+        "کد تایید", "کد تأیید", "کد شما", "کد ورود", "کد فعال",
     ]
     for line in plain.split("\n"):
         line = line.strip()
@@ -78,13 +68,49 @@ def extract_links(text):
                 desc = "🗑️ لینک حذف"
             elif "login" in ll or "log" in ll or "auth" in ll:
                 desc = "🔑 لینک ورود"
+            elif "reset" in ll or "password" in ll:
+                desc = "🔑 لینک بازیابی رمز"
+            elif "unsubscribe" in ll:
+                desc = "❌ لینک لغو عضویت"
             else:
                 desc = "🔗 لینک"
             results.append((desc, link))
     return results
 
 
-# ─── GuerrillaMail API ────────────────────────────────
+# ─── TempMail.lol API ─────────────────────────────────
+
+TEMPMAIL = "https://api.tempmail.lol"
+
+
+async def tempmail_create():
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{TEMPMAIL}/generate")
+        r.raise_for_status()
+        d = r.json()
+        return d["address"], d["token"]
+
+
+async def tempmail_check(token):
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{TEMPMAIL}/auth/{token}")
+        r.raise_for_status()
+        d = r.json()
+        emails = d.get("email", [])
+        result = []
+        for e in emails:
+            result.append({
+                "id": e.get("_id", ""),
+                "sender": e.get("from", ""),
+                "subject": e.get("subject", ""),
+                "body": e.get("body", ""),
+                "html": e.get("html", ""),
+                "date": e.get("date", ""),
+            })
+        return result
+
+
+# ─── GuerrillaMail API (fallback) ─────────────────────
 
 GUERRILLA = "https://api.guerrillamail.com/ajax.php"
 
@@ -118,21 +144,33 @@ async def guerrilla_fetch(sid, eid):
         }
 
 
-# ─── Mail.tm API ──────────────────────────────────────
+# ─── Mail.tm API (fallback) ───────────────────────────
 
 MAILTM = "https://api.mail.tm"
 
 
+def _gen_user(length=10):
+    import random, string
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def _gen_pass(length=14):
+    import random, string
+    chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%"
+    return "".join(random.choices(chars, k=length))
+
+
 async def mailtm_create(username=None):
     if not username:
-        username = generate_username()
-    password = generate_password()
+        username = _gen_user()
+    password = _gen_pass()
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.get(f"{MAILTM}/domains")
         r.raise_for_status()
         domains = [d["domain"] for d in r.json().get("hydra:member", [])]
         if not domains:
             raise ValueError("No domains")
+        import random
         domain = random.choice(domains)
         addr = f"{username}@{domain}"
         await c.post(f"{MAILTM}/accounts", json={"address": addr, "password": password})
@@ -163,16 +201,95 @@ async def mailtm_fetch(token, mid):
 
 # ─── Session ───────────────────────────────────────────
 
-def get_session(cid):
+def get_s(cid):
     return user_sessions.get(cid)
 
 
-def set_session(cid, data):
+def set_s(cid, data):
     user_sessions[cid] = data
 
 
-def clear_session(cid):
+def clear_s(cid):
     user_sessions.pop(cid, None)
+
+
+# ─── Create email with fallback ───────────────────────
+
+async def create_email():
+    """Try tempmail.lol -> guerrillamail -> mail.tm"""
+    try:
+        addr, token = await tempmail_create()
+        return {"backend": "tempmail", "address": addr, "token": token, "count": 0}
+    except Exception as e:
+        logger.warning("tempmail.lol failed: %s", e)
+
+    try:
+        addr, sid, seq = await guerrilla_create()
+        return {"backend": "guerrillamail", "address": addr, "sid": sid, "seq": seq, "count": 0}
+    except Exception as e:
+        logger.warning("guerrillamail failed: %s", e)
+
+    try:
+        addr, pw, token = await mailtm_create()
+        return {"backend": "mailtm", "address": addr, "password": pw, "token": token, "count": 0}
+    except Exception as e:
+        logger.warning("mailtm failed: %s", e)
+
+    raise Exception("All email services failed!")
+
+
+async def check_inbox(session):
+    """Check inbox based on backend"""
+    backend = session["backend"]
+    if backend == "tempmail":
+        return await tempmail_check(session["token"])
+    elif backend == "guerrillamail":
+        msgs, new_seq = await guerrilla_check(session["sid"], session.get("seq", 0))
+        session["seq"] = new_seq
+        return msgs
+    elif backend == "mailtm":
+        return await mailtm_check(session["token"])
+    return []
+
+
+async def fetch_email(session, mid):
+    """Fetch single email based on backend"""
+    backend = session["backend"]
+    if backend == "tempmail":
+        # tempmail already returns full body in list
+        return mid
+    elif backend == "guerrillamail":
+        return await guerrilla_fetch(session["sid"], mid)
+    elif backend == "mailtm":
+        return await mailtm_fetch(session["token"], mid)
+    return {}
+
+
+def get_msg_id(session, msg):
+    """Get message ID from list item"""
+    backend = session["backend"]
+    if backend == "tempmail":
+        return msg  # full message object
+    elif backend == "guerrillamail":
+        return msg.get("mail_id")
+    elif backend == "mailtm":
+        return msg.get("id")
+    return None
+
+
+def get_msg_fields(session, msg):
+    """Get sender, subject, date from list item"""
+    backend = session["backend"]
+    if backend == "tempmail":
+        return msg.get("from", ""), msg.get("subject", ""), msg.get("date", "")[:10]
+    elif backend == "guerrillamail":
+        return msg.get("mail_from", ""), msg.get("mail_subject", ""), msg.get("mail_date", "")[:10]
+    elif backend == "mailtm":
+        sender = msg.get("from", {})
+        if isinstance(sender, dict):
+            sender = sender.get("address", "")
+        return sender, msg.get("subject", ""), msg.get("createdAt", "")[:10]
+    return "", "", ""
 
 
 # ─── UI ────────────────────────────────────────────────
@@ -188,15 +305,8 @@ def main_menu():
             InlineKeyboardButton("🗑️ حذف ایمیل", callback_data="delete"),
         ],
         [
-            InlineKeyboardButton("🌐 دامنه‌ها", callback_data="domains"),
             InlineKeyboardButton("📖 راهنما", callback_data="help"),
         ],
-    ])
-
-
-def back_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="main_menu")]
     ])
 
 
@@ -205,11 +315,10 @@ WELCOME = """🎯 ربات ایمیل موقت حرفه‌ای
 ✨ ایمیل موقت رایگان بسازید و برای ثبت‌نام در سایت‌ها استفاده کنید.
 
 🔒 امکانات:
-  • ساخت ایمیل با چند سرویس مختلف
+  • چند سرویس ایمیل موقت
   • دریافت خودکار ایمیل تأیید
   • استخراج خودکار کد تأیید
   • نمایش لینک‌ها به صورت دکمه
-  • رمز عبور هر ایمیل
 
 📋 منوی اصلی:"""
 
@@ -220,10 +329,8 @@ HELP = """📖 راهنمای ربات
 🔹 /inbox — بررسی صندوق ورودی
 🔹 /stop — توقف دریافت خودکار
 
-💡 نکته: ایمیل‌ها خودکار هر ۱۰ ثانیه بررسی می‌شوند."""
+💡 ایمیل‌ها خودکار هر ۱۰ ثانیه بررسی می‌شوند."""
 
-
-# ─── Message Formatters ────────────────────────────────
 
 def fmt_new_email(sender, subject, code, links):
     s = html_mod.escape(str(sender))
@@ -244,14 +351,14 @@ def fmt_new_email(sender, subject, code, links):
     return msg
 
 
-def fmt_email_detail(detail):
+def fmt_detail(detail):
     sender = html_mod.escape(str(detail.get("sender", "ناشناس")))
-    subject = html_mod.escape(str(detail.get("subject", "(بدون موضوع)")))
-    text = detail.get("body", "")
+    subject = html_mod.escape(str(detail.get("subject", "(بدونوضوع)")))
+    body = detail.get("body", "")
     date = detail.get("date", "")
-    code = extract_code(text)
-    links = extract_links(text)
-    body = html_mod.escape(text[:2000])
+    code = extract_code(body)
+    links = extract_links(body)
+    safe_body = html_mod.escape(body[:2000])
 
     msg = (
         "📩 ایمیل دریافتی\n"
@@ -269,10 +376,9 @@ def fmt_email_detail(detail):
     msg += (
         "\n📄 متن ایمیل:\n"
         "─────────────\n"
-        f"{body}\n"
+        f"{safe_body}\n"
         "─────────────"
     )
-
     buttons = []
     for i, (desc, link) in enumerate(links, 1):
         buttons.append([InlineKeyboardButton(f"🔗 {i}. {desc[:40]}", url=link)])
@@ -294,7 +400,7 @@ async def stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def newmail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    if get_session(cid):
+    if get_s(cid):
         kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🗑️ حذف و ساخت جدید", callback_data="delete_and_new"),
@@ -302,7 +408,7 @@ async def newmail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]
         ])
         await update.message.reply_text(
-            f"⚠️ ایمیل فعال دارید:\n📧 {get_session(cid)['address']}\n\nحذف و جدید بسازید؟",
+            f"⚠️ ایمیل فعال دارید:\n📧 {get_s(cid)['address']}\n\nحذف و جدید بسازید؟",
             reply_markup=kb,
         )
         return
@@ -311,7 +417,7 @@ async def newmail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    s = get_session(cid)
+    s = get_s(cid)
     if not s:
         await update.message.reply_text("⚠️ ایمیل فعالی ندارید. /newmail", reply_markup=main_menu())
         return
@@ -321,19 +427,15 @@ async def inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def do_create(msg, cid):
     status = await msg.reply_text("⏳ در حال ساخت ایمیل موقت...")
     try:
-        addr, sid, seq = await guerrilla_create()
-        set_session(cid, {
-            "backend": "guerrillamail",
-            "address": addr,
-            "sid": sid,
-            "seq": seq,
-            "count": 0,
-        })
+        s = await create_email()
+        set_s(cid, s)
         auto_fetch_jobs[cid] = True
+        backend_name = {"tempmail": "TempMail.lol", "guerrillamail": "GuerrillaMail", "mailtm": "Mail.tm"}.get(s["backend"], "")
         text = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{addr}</code>\n\n"
+            f"📧 آدرس:\n<code>{s['address']}</code>\n\n"
+            f"🌐 سرویس: {backend_name}\n"
             "🔄 دریافت خودکار: فعال\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📌 در سایت ثبت‌نام کنید.\n"
@@ -354,12 +456,7 @@ async def do_create(msg, cid):
 async def do_inbox(msg, cid, s):
     status = await msg.reply_text("⏳ در حال بررسی صندوق...")
     try:
-        if s["backend"] == "guerrillamail":
-            msgs, new_seq = await guerrilla_check(s["sid"], s.get("seq", 0))
-            s["seq"] = new_seq
-        else:
-            msgs = await mailtm_check(s["token"])
-
+        msgs = await check_inbox(s)
         if not msgs:
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
@@ -381,14 +478,7 @@ async def do_inbox(msg, cid, s):
 
         buttons = []
         for i, m in enumerate(msgs[:10], 1):
-            if s["backend"] == "guerrillamail":
-                fr = m.get("mail_from", "ناشناس")
-                subj = m.get("mail_subject", "(بدون موضوع)")
-                dt = m.get("mail_date", "")[:10]
-            else:
-                fr = m.get("from", {}).get("address", "ناشناس")
-                subj = m.get("subject", "(بدونوضوع)")
-                dt = m.get("createdAt", "")[:10]
+            fr, subj, dt = get_msg_fields(s, m)
             lines.append(f"{i}. 📩 {subj}\n   👤 {fr} | 📅 {dt}")
             buttons.append([InlineKeyboardButton(f"📩 {subj[:35]}", callback_data=f"read_{i-1}")])
 
@@ -406,26 +496,25 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
     for cid, active in list(auto_fetch_jobs.items()):
         if not active:
             continue
-        s = get_session(cid)
+        s = get_s(cid)
         if not s:
             auto_fetch_jobs.pop(cid, None)
             continue
         try:
-            if s["backend"] == "guerrillamail":
-                msgs, new_seq = await guerrilla_check(s["sid"], s.get("seq", 0))
-                s["seq"] = new_seq
-            else:
-                msgs = await mailtm_check(s["token"])
-
+            msgs = await check_inbox(s)
             last = s.get("count", 0)
             if len(msgs) > last:
                 new_msgs = msgs[: len(msgs) - last]
                 s["count"] = len(msgs)
                 for m in new_msgs:
-                    if s["backend"] == "guerrillamail":
+                    if s["backend"] == "tempmail":
+                        detail = m
+                    elif s["backend"] == "guerrillamail":
                         detail = await guerrilla_fetch(s["sid"], m.get("mail_id"))
-                    else:
+                    elif s["backend"] == "mailtm":
                         detail = await mailtm_fetch(s["token"], m.get("id"))
+                    else:
+                        continue
 
                     code = extract_code(detail.get("body", ""))
                     links = extract_links(detail.get("body", ""))
@@ -461,10 +550,12 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(WELCOME, reply_markup=main_menu())
 
     elif d == "help":
-        await q.edit_message_text(HELP, reply_markup=back_menu())
+        await q.edit_message_text(HELP, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")]
+        ]))
 
     elif d == "newmail":
-        s = get_session(cid)
+        s = get_s(cid)
         if s:
             kb = InlineKeyboardMarkup([
                 [
@@ -479,19 +570,15 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         status = await q.edit_message_text("⏳ در حال ساخت ایمیل...")
         try:
-            addr, sid, seq = await guerrilla_create()
-            set_session(cid, {
-                "backend": "guerrillamail",
-                "address": addr,
-                "sid": sid,
-                "seq": seq,
-                "count": 0,
-            })
+            s = await create_email()
+            set_s(cid, s)
             auto_fetch_jobs[cid] = True
+            backend_name = {"tempmail": "TempMail.lol", "guerrillamail": "GuerrillaMail", "mailtm": "Mail.tm"}.get(s["backend"], "")
             text = (
                 "✅ ایمیل موقت شما ساخته شد!\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📧 آدرس:\n<code>{addr}</code>\n\n"
+                f"📧 آدرس:\n<code>{s['address']}</code>\n\n"
+                f"🌐 سرویس: {backend_name}\n"
                 "🔄 دریافت خودکار: فعال\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 "📌 در سایت ثبت‌نام کنید.\n"
@@ -508,23 +595,19 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
 
     elif d == "delete_and_new":
-        clear_session(cid)
+        clear_s(cid)
         auto_fetch_jobs.pop(cid, None)
         status = await q.edit_message_text("⏳ در حال ساخت ایمیل...")
         try:
-            addr, sid, seq = await guerrilla_create()
-            set_session(cid, {
-                "backend": "guerrillamail",
-                "address": addr,
-                "sid": sid,
-                "seq": seq,
-                "count": 0,
-            })
+            s = await create_email()
+            set_s(cid, s)
             auto_fetch_jobs[cid] = True
+            backend_name = {"tempmail": "TempMail.lol", "guerrillamail": "GuerrillaMail", "mailtm": "Mail.tm"}.get(s["backend"], "")
             text = (
                 "✅ ایمیل موقت شما ساخته شد!\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📧 آدرس:\n<code>{addr}</code>\n\n"
+                f"📧 آدرس:\n<code>{s['address']}</code>\n\n"
+                f"🌐 سرویس: {backend_name}\n"
                 "🔄 دریافت خودکار: فعال\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 "📌 در سایت ثبت‌نام کنید.\n"
@@ -541,7 +624,7 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
 
     elif d == "copy_email":
-        s = get_session(cid)
+        s = get_s(cid)
         if s:
             await q.answer(f"📧 {s['address']}", show_alert=True)
         else:
@@ -551,7 +634,7 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("✅ لغو شد.", reply_markup=main_menu())
 
     elif d == "delete":
-        s = get_session(cid)
+        s = get_s(cid)
         if not s:
             await q.edit_message_text("⚠️ ایمیلی برای حذف نیست.", reply_markup=main_menu())
             return
@@ -564,89 +647,79 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"⚠️ حذف ایمیل؟\n\n📧 {s['address']}", reply_markup=kb)
 
     elif d == "confirm_delete":
-        clear_session(cid)
+        clear_s(cid)
         auto_fetch_jobs.pop(cid, None)
         await q.edit_message_text("✅ حذف شد.", reply_markup=main_menu())
 
     elif d == "password":
-        s = get_session(cid)
+        s = get_s(cid)
         if not s:
             await q.edit_message_text("⚠️ ایمیل فعالی ندارید. /newmail", reply_markup=main_menu())
             return
-        pw = s.get("password", "ندارد")
+        pw = s.get("password", "ندارد (GuerrillaMail)")
+        backend_name = {"tempmail": "TempMail.lol", "guerrillamail": "GuerrillaMail", "mailtm": "Mail.tm"}.get(s["backend"], "")
         text = (
             "🔑 رمز ایمیل شما\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📧 آدرس:\n<code>{s['address']}</code>\n\n"
             f"🔑 رمز:\n<code>{pw}</code>\n\n"
-            f"🌐 سرویس: {s.get('backend', 'نامشخص')}\n"
+            f"🌐 سرویس: {backend_name}\n"
             "━━━━━━━━━━━━━━━━━━━━"
         )
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=back_menu())
-
-    elif d == "domains":
-        text = (
-            "🌐 سرویس‌های ایمیل موقت\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "  1. GuerrillaMail\n"
-            "  2. Mail.tm\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 ربات خودکار بهترین سرویس را انتخاب می‌کند."
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📧 ساخت ایمیل", callback_data="newmail")],
-            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
-        ])
-        await q.edit_message_text(text, reply_markup=kb)
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")]
+        ]))
 
     elif d == "inbox":
-        s = get_session(cid)
+        s = get_s(cid)
         if not s:
             await q.edit_message_text("⚠️ ایمیل فعالی ندارید.", reply_markup=main_menu())
             return
         await do_inbox_cb(q, cid, s)
 
     elif d.startswith("read_"):
-        s = get_session(cid)
+        s = get_s(cid)
         if not s:
             await q.edit_message_text("⚠️ ایمیل فعالی ندارید.")
             return
         try:
-            if s["backend"] == "guerrillamail":
-                msgs, _ = await guerrilla_check(s["sid"], s.get("seq", 0))
-            else:
-                msgs = await mailtm_check(s["token"])
+            msgs = await check_inbox(s)
             if d == "read_latest":
                 if not msgs:
                     await q.edit_message_text("📭 خالی.")
                     return
-                mid = msgs[0].get("mail_id") if s["backend"] == "guerrillamail" else msgs[0].get("id")
+                m = msgs[0]
             else:
                 idx = int(d.split("_")[1])
                 if idx >= len(msgs):
                     await q.edit_message_text("❌ یافت نشد.")
                     return
-                mid = msgs[idx].get("mail_id") if s["backend"] == "guerrillamail" else msgs[idx].get("id")
+                m = msgs[idx]
 
-            if s["backend"] == "guerrillamail":
-                detail = await guerrilla_fetch(s["sid"], mid)
+            if s["backend"] == "tempmail":
+                detail = m
+            elif s["backend"] == "guerrillamail":
+                detail = await guerrilla_fetch(s["sid"], m.get("mail_id"))
+            elif s["backend"] == "mailtm":
+                detail = await mailtm_fetch(s["token"], m.get("id"))
             else:
-                detail = await mailtm_fetch(s["token"], mid)
+                await q.edit_message_text("❌ خطا")
+                return
 
-            text, kb = fmt_email_detail(detail)
+            text, kb = fmt_detail(detail)
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception as e:
             await q.edit_message_text(f"❌ خطا: {e}")
 
     elif d == "back_inbox":
-        s = get_session(cid)
+        s = get_s(cid)
         if not s:
             await q.edit_message_text("⚠️ ایمیل فعالی ندارید.")
             return
         await do_inbox_cb(q, cid, s)
 
     elif d == "refresh_inbox":
-        s = get_session(cid)
+        s = get_s(cid)
         if not s:
             await q.edit_message_text("⚠️ ایمیل فعالی ندارید.")
             return
@@ -660,12 +733,7 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def do_inbox_cb(q, cid, s):
     await q.edit_message_text("⏳ در حال بررسی...")
     try:
-        if s["backend"] == "guerrillamail":
-            msgs, new_seq = await guerrilla_check(s["sid"], s.get("seq", 0))
-            s["seq"] = new_seq
-        else:
-            msgs = await mailtm_check(s["token"])
-
+        msgs = await check_inbox(s)
         if not msgs:
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
@@ -684,14 +752,7 @@ async def do_inbox_cb(q, cid, s):
 
         buttons = []
         for i, m in enumerate(msgs[:10], 1):
-            if s["backend"] == "guerrillamail":
-                fr = m.get("mail_from", "ناشناس")
-                subj = m.get("mail_subject", "(بدون موضوع)")
-                dt = m.get("mail_date", "")[:10]
-            else:
-                fr = m.get("from", {}).get("address", "ناشناس")
-                subj = m.get("subject", "(بدونوضوع)")
-                dt = m.get("createdAt", "")[:10]
+            fr, subj, dt = get_msg_fields(s, m)
             lines.append(f"{i}. 📩 {subj}\n   👤 {fr} | 📅 {dt}")
             buttons.append([InlineKeyboardButton(f"📩 {subj[:35]}", callback_data=f"read_{i-1}")])
 
