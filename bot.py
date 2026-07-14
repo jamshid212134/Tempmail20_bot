@@ -449,20 +449,28 @@ async def do_create(msg, cid):
         set_s(cid, s)
         auto_fetch_jobs[cid] = True
         backend_name = {"tempmail": "TempMail.lol", "guerrillamail": "GuerrillaMail", "mailtm": "Mail.tm"}.get(s["backend"], "")
+        addr = s['address']
         text = (
-            "✅ ایمیل موقت شما ساخته شد!\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{s['address']}</code>\n\n"
+            f"✅ ایمیل موقت ساخته شد!\n\n"
+            f"📧 آدرس ایمیل شما:\n"
+            f"<code>{addr}</code>\n\n"
             f"🌐 سرویس: {backend_name}\n"
-            "🔄 دریافت خودکار: فعال\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📌 در سایت ثبت‌نام کنید.\n"
-            "ایمیل‌ها خودکار بررسی می‌شوند."
+            f"⏱️ اعتبار: ۱ ساعت\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 مراحل کار:\n\n"
+            f"۱. آدرس بالا رو کپی کنید\n"
+            f"۲. در سایت مورد نظر ثبت‌نام کنید\n"
+            f"۳. ایمیل تأیید ارسال میشه\n"
+            f"۴. ربات خودکار کد/لینک رو میفرسته\n\n"
+            f"🔄 دریافت خودکار: هر ۱۰ ثانیه"
         )
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
+                InlineKeyboardButton("📋 کپی آدرس ایمیل", callback_data="copy_email"),
+            ],
+            [
                 InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
+                InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox"),
             ],
         ])
         await status.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -481,9 +489,11 @@ async def do_inbox(msg, cid, s):
                 [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
             ])
             await status.edit_text(
-                "📭 صندوق خالی است.\n\n"
-                f"📧 {s['address']}\n\n"
-                "🔄 دریافت خودکار فعال است.",
+                f"📭 صندوق خالی است\n\n"
+                f"📧 آدرس شما:\n<code>{s['address']}</code>\n\n"
+                "🔄 دریافت خودکار فعال است.\n\n"
+                "📌 ایمیل تأیید به این آدرس ارسال بشه،\n"
+                "خودکار کد و لینک رو دریافت میکنید.",
                 reply_markup=kb,
             )
             return
@@ -521,6 +531,7 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             msgs = await check_inbox(s)
             last = s.get("count", 0)
+            logger.info("Auto-check cid=%d backend=%s emails=%d prev=%d", cid, s["backend"], len(msgs), last)
             if len(msgs) > last:
                 new_msgs = msgs[: len(msgs) - last]
                 s["count"] = len(msgs)
@@ -769,7 +780,8 @@ async def do_inbox_cb(q, cid, s):
                 [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
             ])
             await q.edit_message_text(
-                f"📭 خالی.\n📧 {s['address']}", reply_markup=kb,
+                f"📭 خالی است\n\n📧 {s['address']}\n\n"
+                "🔄 دریافت خودکار فعال است.", reply_markup=kb,
             )
             return
 
