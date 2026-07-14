@@ -48,12 +48,12 @@ def extract_code(text):
     return None
 
 
-def extract_links(text):
+def extract_verify_link(text):
     if not text:
-        return []
+        return None
     plain = html_mod.unescape(text)
     seen = set()
-    results = []
+    verify_kws = ["verify", "confirm", "activation", "activate", "valid", "approve"]
     for line in plain.split("\n"):
         for link in re.findall(r'(https?://[^\s<>"\']+)', line):
             link = link.rstrip('.,;:!?')
@@ -62,20 +62,18 @@ def extract_links(text):
                 continue
             seen.add(link)
             ll = link.lower()
-            if "verify" in ll or "confirm" in ll:
-                desc = "✅ لینک تأیید"
-            elif "delete" in ll:
-                desc = "🗑️ لینک حذف"
-            elif "login" in ll or "log" in ll or "auth" in ll:
-                desc = "🔑 لینک ورود"
-            elif "reset" in ll or "password" in ll:
-                desc = "🔑 لینک بازیابی رمز"
-            elif "unsubscribe" in ll:
-                desc = "❌ لینک لغو عضویت"
-            else:
-                desc = "🔗 لینک"
-            results.append((desc, link))
-    return results
+            for kw in verify_kws:
+                if kw in ll:
+                    return link
+    for line in plain.split("\n"):
+        for link in re.findall(r'(https?://[^\s<>"\']+)', line):
+            link = link.rstrip('.,;:!?')
+            link = re.sub(r'[)}\]]+$', '', link)
+            if link in seen:
+                continue
+            seen.add(link)
+            return link
+    return None
 
 
 # ─── TempMail.lol API ─────────────────────────────────
@@ -332,7 +330,7 @@ HELP = """📖 راهنمای ربات
 💡 ایمیل‌ها خودکار هر ۱۰ ثانیه بررسی می‌شوند."""
 
 
-def fmt_new_email(sender, subject, code, links):
+def fmt_new_email(sender, subject, code, verify_link):
     s = html_mod.escape(str(sender))
     j = html_mod.escape(str(subject))
     msg = (
@@ -343,11 +341,9 @@ def fmt_new_email(sender, subject, code, links):
     )
     if code:
         msg += f"\n🔑 کد تأیید: <code>{html_mod.escape(code)}</code>\n"
-    if links:
-        msg += f"\n🔗 لینک‌ها ({len(links)}):\n"
-        for i, (desc, _) in enumerate(links, 1):
-            msg += f"{i}. {desc}\n"
-    msg += "\n━━━━━━━━━━━━━━━━━━━━\n💡 لینک مورد نظر را انتخاب کنید:"
+    if verify_link:
+        msg += f"\n🔗 لینک تأیید: {verify_link}\n"
+    msg += "\n━━━━━━━━━━━━━━━━━━━━"
     return msg
 
 
@@ -357,7 +353,7 @@ def fmt_detail(detail):
     body = detail.get("body", "")
     date = detail.get("date", "")
     code = extract_code(body)
-    links = extract_links(body)
+    verify_link = extract_verify_link(body)
     safe_body = html_mod.escape(body[:2000])
 
     msg = (
@@ -369,10 +365,8 @@ def fmt_detail(detail):
     )
     if code:
         msg += f"\n🔑 کد تأیید: <code>{html_mod.escape(code)}</code>\n"
-    if links:
-        msg += f"\n🔗 لینک‌ها ({len(links)}):\n"
-        for i, (desc, _) in enumerate(links, 1):
-            msg += f"{i}. {desc}\n"
+    if verify_link:
+        msg += f"\n🔗 لینک تأیید: {verify_link}\n"
     msg += (
         "\n📄 متن ایمیل:\n"
         "─────────────\n"
@@ -380,8 +374,8 @@ def fmt_detail(detail):
         "─────────────"
     )
     buttons = []
-    for i, (desc, link) in enumerate(links, 1):
-        buttons.append([InlineKeyboardButton(f"🔗 {i}. {desc[:40]}", url=link)])
+    if verify_link:
+        buttons.append([InlineKeyboardButton("🔗 لینک تأیید", url=verify_link)])
     buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_inbox")])
     return msg, InlineKeyboardMarkup(buttons)
 
@@ -517,16 +511,16 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     code = extract_code(detail.get("body", ""))
-                    links = extract_links(detail.get("body", ""))
+                    verify_link = extract_verify_link(detail.get("body", ""))
                     notify = fmt_new_email(
                         detail.get("sender", ""),
                         detail.get("subject", ""),
                         code,
-                        links,
+                        verify_link,
                     )
                     buttons = []
-                    for i, (desc, link) in enumerate(links, 1):
-                        buttons.append([InlineKeyboardButton(f"🔗 {i}. {desc[:40]}", url=link)])
+                    if verify_link:
+                        buttons.append([InlineKeyboardButton("🔗 لینک تأیید", url=verify_link)])
                     buttons.append([InlineKeyboardButton("📩 خواندن ایمیل", callback_data="read_latest")])
                     await ctx.bot.send_message(
                         chat_id=cid,
