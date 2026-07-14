@@ -103,13 +103,14 @@ async def guerrilla_create() -> dict:
         return {
             "address": data.get("email_addr", ""),
             "sid_token": data.get("sid_token", ""),
+            "seq": data.get("seq", 0),
         }
 
 
-async def guerrilla_check(sid_token: str) -> list[dict]:
+async def guerrilla_check(sid_token: str, seq: int = 0) -> dict:
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
-            f"{GUERRILLA_URL}?f=check_email&ip=127.0.0.1&sid_token={sid_token}",
+            f"{GUERRILLA_URL}?f=check_email&ip=127.0.0.1&sid_token={sid_token}&seq={seq}",
         )
         resp.raise_for_status()
         data = resp.json()
@@ -123,7 +124,7 @@ async def guerrilla_check(sid_token: str) -> list[dict]:
                 "body": e.get("mail_body", ""),
                 "date": e.get("mail_date", ""),
             })
-        return result
+        return {"messages": result, "new_seq": data.get("seq", seq)}
 
 
 async def guerrilla_fetch(sid_token: str, email_id: str) -> dict:
@@ -242,9 +243,11 @@ async def create_new_email(msg, chat_id):
         data = await guerrilla_create()
         address = data["address"]
         sid_token = data["sid_token"]
+        seq = data.get("seq", 0)
         set_session(chat_id, {
             "address": address,
             "sid_token": sid_token,
+            "seq": seq,
             "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
@@ -281,7 +284,9 @@ async def inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_inbox(msg, chat_id, session):
     status_msg = await msg.reply_text("⏳ در حال بررسی صندوق...")
     try:
-        messages = await guerrilla_check(session["sid_token"])
+        result = await guerrilla_check(session["sid_token"], session.get("seq", 0))
+        messages = result["messages"]
+        session["seq"] = result["new_seq"]
         if not messages:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
@@ -329,7 +334,9 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
             auto_fetch_jobs.pop(chat_id, None)
             continue
         try:
-            messages = await guerrilla_check(session["sid_token"])
+            result = await guerrilla_check(session["sid_token"], session.get("seq", 0))
+            messages = result["messages"]
+            session["seq"] = result["new_seq"]
             current_count = len(messages)
             last_count = session.get("message_count", 0)
             if current_count > last_count:
@@ -416,7 +423,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ ایمیل فعالی ندارید.")
             return
         try:
-            messages = await guerrilla_check(session["sid_token"])
+            result = await guerrilla_check(session["sid_token"], session.get("seq", 0))
+            messages = result["messages"]
+            session["seq"] = result["new_seq"]
             if data == "read_latest":
                 if not messages:
                     await query.edit_message_text("📭 خالی.")
@@ -457,9 +466,11 @@ async def create_new_email_callback(query, chat_id):
         data = await guerrilla_create()
         address = data["address"]
         sid_token = data["sid_token"]
+        seq = data.get("seq", 0)
         set_session(chat_id, {
             "address": address,
             "sid_token": sid_token,
+            "seq": seq,
             "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
@@ -486,7 +497,9 @@ async def create_new_email_callback(query, chat_id):
 async def show_inbox_callback(query, chat_id, session):
     await query.edit_message_text("⏳ در حال بررسی...")
     try:
-        messages = await guerrilla_check(session["sid_token"])
+        result = await guerrilla_check(session["sid_token"], session.get("seq", 0))
+        messages = result["messages"]
+        session["seq"] = result["new_seq"]
         if not messages:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
