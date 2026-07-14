@@ -23,28 +23,52 @@ auto_fetch_jobs: dict[int, bool] = {}
 
 # ─── Helpers ───────────────────────────────────────────
 
+def strip_html(text):
+    if not text:
+        return ""
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html_mod.unescape(text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def extract_code(text):
     if not text:
         return None
-    plain = html_mod.unescape(text)
-    keywords = [
-        "verification code", "your code", "code is", "code:",
-        "enter code", "use code", "otp", "launch code", "pin",
-        "verify", "confirmation", "confirm",
-        "کد تایید", "کد تأیید", "کد شما", "کد ورود", "کد فعال",
+    plain = strip_html(text)
+    patterns_kw = [
+        r"verification\s+code\s*[:\s]+(\d{4,8})",
+        r"your\s+code\s*[:\s]+(\d{4,8})",
+        r"code\s+is\s*[:\s]+(\d{4,8})",
+        r"code\s*:\s*(\d{4,8})",
+        r"enter\s+(?:this\s+)?code\s*[:\s]+(\d{4,8})",
+        r"use\s+(?:this\s+)?code\s*[:\s]+(\d{4,8})",
+        r"otp\s*[:\s]+(\d{4,8})",
+        r"launch\s+code\s*[:\s]+(\d{4,8})",
+        r"pin\s*[:\s]+(\d{4,8})",
+        r"کد\s+(?:تأ?یید|شما|ورود|فعال)\s*[:\s]+(\d{4,8})",
     ]
-    for line in plain.split("\n"):
-        line = line.strip()
-        low = line.lower()
-        for kw in keywords:
-            if kw in low:
-                m = re.search(r"[:\s]+(\d{4,8})\b", line)
-                if m:
-                    return m.group(1)
-    for line in plain.split("\n"):
-        m = re.fullmatch(r"\s*(\d{4,8})\s*", line.strip())
+    for p in patterns_kw:
+        m = re.search(p, plain, re.IGNORECASE)
         if m:
             return m.group(1)
+    for p in patterns_kw:
+        for line in plain.split("\n"):
+            m = re.search(p, line, re.IGNORECASE)
+            if m:
+                return m.group(1)
+    for line in plain.split("\n"):
+        line = line.strip()
+        m = re.fullmatch(r'\s*(\d{4,8})\s*', line)
+        if m:
+            return m.group(1)
+    m = re.search(r'\b(\d{6})\b', plain)
+    if m:
+        return m.group(1)
     return None
 
 
@@ -333,17 +357,17 @@ HELP = """📖 راهنمای ربات
 def fmt_new_email(sender, subject, code, verify_link):
     s = html_mod.escape(str(sender))
     j = html_mod.escape(str(subject))
-    msg = (
-        "📩 ایمیل جدید دریافت شد!\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 فرستنده: {s}\n"
-        f"📌 موضوع: {j}\n"
-    )
+    msg = "📩 ایمیل جدید!\n"
+    msg += f"👤 {s}\n"
+    msg += f"📌 {j}\n\n"
     if code:
-        msg += f"\n🔑 کد تأیید: <code>{html_mod.escape(code)}</code>\n"
+        msg += f"🔑 کد تأیید: {code}\n\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "👆 کد بالا رو کپی کنید\n"
     if verify_link:
-        msg += f"\n🔗 لینک تأیید: {verify_link}\n"
-    msg += "\n━━━━━━━━━━━━━━━━━━━━"
+        msg += "\n👆 دکمه زیر رو بزنید تا لینک باز بشه"
+    if not code and not verify_link:
+        msg += "❌ کد یا لینکی پیدا نشد"
     return msg
 
 
@@ -354,28 +378,23 @@ def fmt_detail(detail):
     date = detail.get("date", "")
     code = extract_code(body)
     verify_link = extract_verify_link(body)
-    safe_body = html_mod.escape(body[:2000])
+    plain_body = strip_html(body)[:2000]
 
-    msg = (
-        "📩 ایمیل دریافتی\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 فرستنده: {sender}\n"
-        f"📌 موضوع: {subject}\n"
-        f"📅 تاریخ: {date}\n"
-    )
+    msg = "📩 ایمیل دریافتی\n"
+    msg += f"👤 {sender}\n"
+    msg += f"📌 {subject}\n"
+    msg += f"📅 {date}\n\n"
     if code:
-        msg += f"\n🔑 کد تأیید: <code>{html_mod.escape(code)}</code>\n"
+        msg += f"🔑 کد تأیید: {code}\n"
     if verify_link:
-        msg += f"\n🔗 لینک تأیید: {verify_link}\n"
-    msg += (
-        "\n📄 متن ایمیل:\n"
-        "─────────────\n"
-        f"{safe_body}\n"
-        "─────────────"
-    )
+        msg += "🔗 لینک تأیید:\n"
+        msg += f"{verify_link}\n"
+    msg += f"\n📄 متن ایمیل:\n{plain_body}"
     buttons = []
+    if code:
+        buttons.append([InlineKeyboardButton(f"📋 کپی کد: {code}", callback_data=f"copy_{code}")])
     if verify_link:
-        buttons.append([InlineKeyboardButton("🔗 لینک تأیید", url=verify_link)])
+        buttons.append([InlineKeyboardButton("🔗 باز کردن لینک تأیید", url=verify_link)])
     buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_inbox")])
     return msg, InlineKeyboardMarkup(buttons)
 
@@ -512,16 +531,23 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
 
                     code = extract_code(detail.get("body", ""))
                     verify_link = extract_verify_link(detail.get("body", ""))
-                    notify = fmt_new_email(
-                        detail.get("sender", ""),
-                        detail.get("subject", ""),
-                        code,
-                        verify_link,
-                    )
+
                     buttons = []
+                    if code:
+                        buttons.append([InlineKeyboardButton(f"📋 کپی کد: {code}", callback_data=f"copy_{code}")])
                     if verify_link:
-                        buttons.append([InlineKeyboardButton("🔗 لینک تأیید", url=verify_link)])
-                    buttons.append([InlineKeyboardButton("📩 خواندن ایمیل", callback_data="read_latest")])
+                        buttons.append([InlineKeyboardButton("🔗 باز کردن لینک تأیید", url=verify_link)])
+                    buttons.append([InlineKeyboardButton("📩 مشاهده ایمیل کامل", callback_data="read_latest")])
+
+                    sender = detail.get("sender", "")
+                    subject = detail.get("subject", "")
+                    notify = f"📩 ایمیل جدید!\n👤 {sender}\n📌 {subject}\n\n"
+                    if code:
+                        notify += f"🔑 کد تأیید: {code}\n"
+                    if verify_link:
+                        notify += "👇 لینک تأیید رو باز کنید"
+                    if not code and not verify_link:
+                        notify += "❌ کد یا لینکی پیدا نشد\n📩 ایمیل کامل رو ببینید"
                     await ctx.bot.send_message(
                         chat_id=cid,
                         text=notify,
@@ -542,6 +568,10 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if d == "main_menu":
         await q.edit_message_text(WELCOME, reply_markup=main_menu())
+
+    elif d.startswith("copy_"):
+        code = d.replace("copy_", "")
+        await q.answer(f"✅ کد {code} کپی شد!\nحالا در سایت Paste کنید (Ctrl+V)", show_alert=True)
 
     elif d == "help":
         await q.edit_message_text(HELP, reply_markup=InlineKeyboardMarkup([
