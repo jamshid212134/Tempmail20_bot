@@ -2,7 +2,8 @@ import httpx
 import random
 import string
 import logging
-import asyncio
+import html as html_mod
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,6 @@ def generate_random_password(length: int = 14) -> str:
 def extract_verification_code(text: str) -> str | None:
     if not text:
         return None
-    import re
-    import html as html_mod
     plain = html_mod.unescape(text)
     lines = plain.split("\n")
     keywords = [
@@ -52,11 +51,25 @@ def extract_verification_code(text: str) -> str | None:
     return None
 
 
+def extract_all_links(text: str) -> list[str]:
+    if not text:
+        return []
+    plain = html_mod.unescape(text)
+    raw_links = re.findall(r'(https?://[^\s<>"\']+)', plain)
+    cleaned = []
+    seen = set()
+    for link in raw_links:
+        link = link.rstrip('.,;:!?')
+        link = re.sub(r'[)}\]]+$', '', link)
+        if link not in seen:
+            seen.add(link)
+            cleaned.append(link)
+    return cleaned
+
+
 def extract_link_context(text: str) -> list[tuple[str, str]]:
     if not text:
         return []
-    import re
-    import html as html_mod
     plain = html_mod.unescape(text)
     lines = plain.split("\n")
     results = []
@@ -75,7 +88,6 @@ def extract_link_context(text: str) -> list[tuple[str, str]]:
 
 
 def _clean_link_desc(line: str, link: str) -> str:
-    import re
     desc = line.replace(link, "").strip()
     desc = re.sub(r'^[:\s\-–—]+', '', desc)
     desc = re.sub(r'[.:;\s]+$', '', desc)
@@ -177,51 +189,6 @@ class MailTmBackend(EmailBackend):
         return d.get("createdAt", "")[:10]
 
 
-class SmailsBackend(EmailBackend):
-    name = "smails.dev"
-    BASE_URL = "https://smails.dev/api"
-
-    async def create(self, username: str, password: str) -> str:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(f"{self.BASE_URL}/mailbox")
-            resp.raise_for_status()
-            data = resp.json()
-            self.address = data["address"]
-            self._token = data["token"]
-            self.password = password
-            return self.address
-
-    async def get_messages(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{self.BASE_URL}/mailbox/messages",
-                headers={"Authorization": f"Bearer {self._token}"},
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-    async def get_message_detail(self, msg_id: str) -> dict:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{self.BASE_URL}/mailbox/messages/{msg_id}",
-                headers={"Authorization": f"Bearer {self._token}"},
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-    def extract_sender(self, d: dict) -> str:
-        return d.get("from", d.get("sender", "ناشناس"))
-
-    def extract_subject(self, d: dict) -> str:
-        return d.get("subject", "(بدون موضوع)")
-
-    def extract_text(self, d: dict) -> str:
-        return d.get("text", d.get("textBody", ""))
-
-    def extract_date(self, d: dict) -> str:
-        return d.get("createdAt", d.get("date", ""))[:10]
-
-
 class GuerrillaBackend(EmailBackend):
     name = "guerrillamail"
     BASE_URL = "https://api.guerrillamail.com/ajax.php"
@@ -289,7 +256,7 @@ class GuerrillaBackend(EmailBackend):
         return d.get("createdAt", "")[:10]
 
 
-BACKENDS = [MailTmBackend, SmailsBackend, GuerrillaBackend]
+BACKENDS = [MailTmBackend, GuerrillaBackend]
 
 
 async def create_email(username: str = None) -> tuple[EmailBackend, str]:
