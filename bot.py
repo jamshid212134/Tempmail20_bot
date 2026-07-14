@@ -107,7 +107,7 @@ TEMPMAIL = "https://api.tempmail.lol"
 
 async def tempmail_create():
     async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{TEMPMAIL}/generate")
+        r = await c.post(f"{TEMPMAIL}/v2/inbox/create")
         r.raise_for_status()
         d = r.json()
         return d["address"], d["token"]
@@ -115,19 +115,24 @@ async def tempmail_create():
 
 async def tempmail_check(token):
     async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{TEMPMAIL}/auth/{token}")
+        r = await c.get(f"{TEMPMAIL}/v2/inbox", params={"token": token})
         r.raise_for_status()
         d = r.json()
-        emails = d.get("email", [])
+        if d.get("expired"):
+            raise Exception("اینباکس منقضی شده!")
+        emails = d.get("emails", [])
         result = []
         for e in emails:
+            body = e.get("body", "") or ""
+            html = e.get("html", "") or ""
+            content = body if body.strip() else html
             result.append({
-                "id": e.get("_id", ""),
+                "id": e.get("_id", str(len(result))),
                 "sender": e.get("from", ""),
                 "subject": e.get("subject", ""),
-                "body": e.get("body", ""),
-                "html": e.get("html", ""),
-                "date": e.get("date", ""),
+                "body": content,
+                "html": html,
+                "date": str(e.get("date", "")),
             })
         return result
 
@@ -529,8 +534,8 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
                     else:
                         continue
 
-                    code = extract_code(detail.get("body", ""))
-                    verify_link = extract_verify_link(detail.get("body", ""))
+                    code = extract_code(detail.get("body", "")) or extract_code(detail.get("html", ""))
+                    verify_link = extract_verify_link(detail.get("body", "")) or extract_verify_link(detail.get("html", ""))
 
                     buttons = []
                     if code:
