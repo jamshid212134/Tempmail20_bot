@@ -1,14 +1,16 @@
 import httpx
-import re
+import hashlib
+import string
+import random
 import logging
-import html as html_mod
-import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    filters,
 )
 from config import BOT_TOKEN
 
@@ -18,602 +20,264 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-user_sessions: dict[int, dict] = {}
-auto_fetch_jobs: dict[int, bool] = {}
-
-GUERRILLA = "https://api.guerrillamail.com/ajax.php"
+PWNED_API = "https://api.pwnedpasswords.com/range"
 
 
-def strip_html(text):
-    if not text:
-        return ""
-    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<p[^>]*>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = html_mod.unescape(text)
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
-
-
-def extract_code(text):
-    if not text:
-        return None
-    plain = strip_html(text)
-    patterns = [
-        r"(?:verification|confirm|activate|launch|otp|pin)\s*(?:code|number)?\s*[:\s]+(\d{4,8})",
-        r"(?:your|the)\s+code\s+is\s*[:\s]+(\d{4,8})",
-        r"code\s*:\s*(\d{4,8})",
-        r"کد\s+(?:تأ?یید|شما|ورود|فعال)\s*[:\s]+(\d{4,8})",
-        r">\s*(\d{4,8})\s*<",
-    ]
-    for p in patterns:
-        m = re.search(p, plain, re.IGNORECASE)
-        if m:
-            return m.group(1)
-    for line in plain.split("\n"):
-        m = re.fullmatch(r'\s*(\d{4,8})\s*', line.strip())
-        if m:
-            return m.group(1)
-    m = re.search(r'\b(\d{6})\b', plain)
-    if m:
-        return m.group(1)
-    return None
-
-
-def extract_verify_link(text):
-    if not text:
-        return None
-    plain = strip_html(text)
-    seen = set()
-    for line in plain.split("\n"):
-        for link in re.findall(r'(https?://[^\s<>"\']+)', line):
-            link = link.rstrip('.,;:!?')
-            link = re.sub(r'[)}\]]+$', '', link)
-            if link in seen:
-                continue
-            seen.add(link)
-            ll = link.lower()
-            if any(kw in ll for kw in ["verify", "confirm", "activation", "activate", "valid", "approve", "token"]):
-                return link
-    for line in plain.split("\n"):
-        for link in re.findall(r'(https?://[^\s<>"\']+)', line):
-            link = link.rstrip('.,;:!?')
-            link = re.sub(r'[)}\]]+$', '', link)
-            if link not in seen:
-                return link
-    return None
-
-
-async def guerrilla_create():
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{GUERRILLA}?f=get_email_address&ip=127.0.0.1&agent=Python")
+def check_password(password: str) -> tuple[bool, int]:
+    sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix, suffix = sha1[:5], sha1[5:]
+    try:
+        r = httpx.get(f"{PWNED_API}/{prefix}", timeout=10)
         r.raise_for_status()
-        d = r.json()
-        return d["email_addr"], d["sid_token"], 0
+        for line in r.text.splitlines():
+            hash_suffix, count = line.split(":")
+            if hash_suffix == suffix:
+                return True, int(count)
+        return False, 0
+    except Exception as e:
+        logger.error("Pwned API error: %s", e)
+        raise
 
 
-async def guerrilla_check(sid, seq=0):
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{GUERRILLA}?f=check_email&ip=127.0.0.1&sid_token={sid}&seq={seq}")
-        if r.status_code == 429:
-            logger.warning("GuerrillaMail 429")
-            return [], seq
-        r.raise_for_status()
-        d = r.json()
-        return d.get("list", []), d.get("seq", seq)
+def generate_password(length=16) -> str:
+    if length < 12:
+        length = 12
+    chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    while True:
+        pwd = "".join(random.choices(chars, k=length))
+        has_upper = any(c in string.ascii_uppercase for c in pwd)
+        has_lower = any(c in string.ascii_lowercase for c in pwd)
+        has_digit = any(c in string.digits for c in pwd)
+        has_special = any(c in "!@#$%^&*()-_=+" for c in pwd)
+        if has_upper and has_lower and has_digit and has_special:
+            return pwd
 
 
-async def guerrilla_fetch(sid, eid):
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{GUERRILLA}?f=fetch_email&ip=127.0.0.1&sid_token={sid}&email_id={eid}")
-        r.raise_for_status()
-        d = r.json()
-        return {
-            "sender": d.get("mail_from", ""),
-            "subject": d.get("mail_subject", ""),
-            "body": d.get("mail_body", ""),
-            "html": d.get("mail_body", ""),
-            "date": d.get("mail_date", ""),
-        }
-
-
-async def guerrilla_set_email(sid, addr):
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{GUERRILLA}?f=set_email_user&ip=127.0.0.1&sid_token={sid}&email_user={addr}")
-        r.raise_for_status()
-        return r.json()
-
-
-def get_s(cid):
-    return user_sessions.get(cid)
-
-
-def set_s(cid, data):
-    user_sessions[cid] = data
-
-
-def clear_s(cid):
-    user_sessions.pop(cid, None)
+def strength_bar(score: int) -> str:
+    if score == 0:
+        return "🟢🟢🟢🟢🟢 بسیار قوی"
+    elif score < 10:
+        return "🟡🟢🟢🟢🟢 قوی"
+    elif score < 100:
+        return "🟠🟡🟢🟢🟢 متوسط"
+    elif score < 1000:
+        return "🔴🟠🟡🟢🟢 ضعیف"
+    elif score < 10000:
+        return "🔴🔴🟠🟡🟢 بسیار ضعیف"
+    else:
+        return "🔴🔴🔴🟠🟡 خطرناک"
 
 
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📧 ساخت ایمیل جدید", callback_data="newmail")],
-        [InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
-         InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
-        [InlineKeyboardButton("🗑️ حذف ایمیل", callback_data="delete")],
+        [InlineKeyboardButton("🔍 بررسی رمز عبور", callback_data="check")],
+        [InlineKeyboardButton("🔐 ساخت رمز قوی", callback_data="generate")],
+        [InlineKeyboardButton("📊 آمار نشت جهانی", callback_data="stats")],
+        [InlineKeyboardButton("📖 راهنما", callback_data="help")],
     ])
 
 
-WELCOME = """🎯 ربات ایمیل موقت
+WELCOME = """🔐 ربات بررسی امنیت رمز عبور
 
-📧 ایمیل موقت بسازید و برای ثبت‌نام استفاده کنید.
-🔄 کد تأیید و لینک فعال‌سازی خودکار دریافت میشه.
+🔍 آیا رمز عبور شما در نشت اطلاعات پیدا شده؟
 
-💡 منوی اصلی:"""
+💡 امکانات:
+  • بررسی رمز عبور در ۱۷+ میلیارد نشت
+  • ساخت رمز عبور قوی و امن
+  • آمار نشت اطلاعات جهانی
 
-HELP = """📖 راهنما
+🔒 امنیت: رمز شما هیچوقت از دستگاه خارج نمیشه!
+
+📋 منوی اصلی:"""
+
+HELP = """📖 راهنمای ربات
 
 🔹 /start — منوی اصلی
-🔹 /newmail — ساخت ایمیل جدید
-🔹 /inbox — بررسی صندوق ورودی
+🔹 /check — بررسی رمز عبور
+🔹 /generate — ساخت رمز قوی
 
-💡 هر ۳۰ ثانیه صندوق چک میشه."""
+💡 نحوه کار:
+۱. رمز عبورتون رو بفرستید
+۲. ربات بررسی میکنه
+۳. نتیجه نشون داده میشه
 
-
-def fmt_detail(detail):
-    body = detail.get("body", "")
-    html = detail.get("html", "")
-    content = body if body.strip() else html
-    code = extract_code(content)
-    link = extract_verify_link(content)
-    plain = strip_html(content)[:2000]
-
-    sender = html_mod.escape(str(detail.get("sender", "ناشناس")))
-    subject = html_mod.escape(str(detail.get("subject", "")))
-    date = detail.get("date", "")
-
-    msg = f"📩 {subject}\n👤 {sender}\n📅 {date}\n\n"
-    if code:
-        msg += f"🔑 کد تأیید: {code}\n"
-    if link:
-        msg += f"🔗 لینک تأیید:\n{link}\n"
-    msg += f"\n📄 متن:\n{plain}"
-
-    buttons = []
-    if code:
-        buttons.append([InlineKeyboardButton(f"📋 کپی کد: {code}", callback_data=f"copy_{code}")])
-    if link:
-        buttons.append([InlineKeyboardButton("🔗 باز کردن لینک", url=link)])
-    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_inbox")])
-    return msg, InlineKeyboardMarkup(buttons)
-
-
-async def do_create(msg, cid):
-    status = await msg.reply_text("⏳ در حال ساخت ایمیل...")
-    try:
-        addr, sid, seq = await guerrilla_create()
-        set_s(cid, {
-            "backend": "guerrillamail",
-            "address": addr,
-            "sid": sid,
-            "seq": seq,
-            "count": 0,
-        })
-        auto_fetch_jobs[cid] = True
-        text = (
-            f"✅ ایمیل موقت ساخته شد!\n\n"
-            f"📧 آدرس ایمیل:\n"
-            f"<code>{addr}</code>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 مراحل کار:\n\n"
-            f"۱. آدرس بالا رو کپی کنید\n"
-            f"۲. در سایت مورد نظر ثبت‌نام کنید\n"
-            f"۳. ایمیل تأیید ارسال میشه\n"
-            f"۴. ربات خودکار کد/لینک رو میفرسته\n\n"
-            f"⏱️ اعتبار: ۱ ساعت\n"
-            f"🔄 دریافت خودکار: هر ۳۰ ثانیه"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 کپی آدرس ایمیل", callback_data="copy_email")],
-            [InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox")],
-        ])
-        await status.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        logger.error("Create error: %s", e)
-        await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
-
-
-async def do_inbox(msg, cid, s):
-    status = await msg.reply_text("⏳ در حال بررسی صندوق...")
-    try:
-        msgs, _ = await guerrilla_check(s["sid"], s.get("seq", 0))
-        if not msgs:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
-                [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
-            ])
-            await status.edit_text(
-                f"📭 خالی است\n\n📧 {s['address']}\n\n"
-                "🔄 دریافت خودکار فعال است.\n"
-                "ایمیل تأیید به این آدرس ارسال بشه، خودکار دریافت میشه.",
-                reply_markup=kb,
-            )
-            return
-
-        new_count = len(msgs) - s.get("count", 0)
-        s["count"] = len(msgs)
-        lines = [f"📬 {len(msgs)} ایمیل:\n"]
-        if new_count > 0:
-            lines.insert(0, f"🔔 {new_count} جدید!\n")
-
-        buttons = []
-        for i, m in enumerate(msgs[:10], 1):
-            fr = m.get("mail_from", "")
-            subj = m.get("mail_subject", "")
-            dt = m.get("mail_date", "")
-            lines.append(f"{i}. 📩 {subj}\n   👤 {fr}")
-            buttons.append([InlineKeyboardButton(f"📩 {subj[:35]}", callback_data=f"read_{i-1}")])
-
-        buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
-        buttons.append([InlineKeyboardButton("🏠 منو", callback_data="main_menu")])
-        await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        logger.error("Inbox error: %s", e)
-        await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
-
-
-async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
-    for cid, active in list(auto_fetch_jobs.items()):
-        if not active:
-            continue
-        s = get_s(cid)
-        if not s:
-            auto_fetch_jobs.pop(cid, None)
-            continue
-        try:
-            msgs, new_seq = await guerrilla_check(s["sid"], s.get("seq", 0))
-            s["seq"] = new_seq
-            last = s.get("count", 0)
-            logger.info("Auto-check cid=%d emails=%d prev=%d", cid, len(msgs), last)
-            if len(msgs) > last:
-                new_msgs = msgs[: len(msgs) - last]
-                s["count"] = len(msgs)
-                for m in new_msgs:
-                    eid = m.get("mail_id")
-                    if not eid:
-                        continue
-                    detail = await guerrilla_fetch(s["sid"], eid)
-                    content = detail.get("body", "") or detail.get("html", "")
-                    code = extract_code(content)
-                    link = extract_verify_link(content)
-
-                    sender = detail.get("sender", "")
-                    subject = detail.get("subject", "")
-
-                    buttons = []
-                    if code:
-                        buttons.append([InlineKeyboardButton(f"📋 کپی کد: {code}", callback_data=f"copy_{code}")])
-                    if link:
-                        buttons.append([InlineKeyboardButton("🔗 باز کردن لینک تأیید", url=link)])
-                    buttons.append([InlineKeyboardButton("📩 مشاهده ایمیل کامل", callback_data="read_latest")])
-
-                    notify = f"📩 ایمیل جدید!\n👤 {sender}\n📌 {subject}\n\n"
-                    if code:
-                        notify += f"🔑 کد تأیید: {code}\n"
-                    if link:
-                        notify += "🔗 لینک تأیید:\n"
-                        notify += f"{link}\n"
-                    if not code and not link:
-                        notify += "📩 ایمیل کامل رو ببینید"
-                    await ctx.bot.send_message(
-                        chat_id=cid,
-                        text=notify,
-                        parse_mode="HTML",
-                        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-                    )
-        except Exception as e:
-            logger.error("Auto-check error: %s", e)
+🔒 امنیت:
+فقط ۵ کاراکتر اول هش رمز به سرور فرستاده میشه.
+خود رمز هیچوقت از دستگاه شما خارج نمیشه."""
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME, reply_markup=main_menu())
 
 
-async def newmail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    s = get_s(cid)
-    if s:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑️ حذف و ساخت جدید", callback_data="delete_and_new"),
-             InlineKeyboardButton("❌ انصراف", callback_data="cancel")],
-        ])
-        await update.message.reply_text(
-            f"⚠️ ایمیل فعال دارید:\n📧 {s['address']}\n\nحذف و جدید بسازید؟", reply_markup=kb,
+async def check_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔍 رمز عبور خود را وارد کنید:\n\n"
+        "⚠️ رمز شما ذخیره نمیشه و فقط بررسی میشه.\n"
+        "💡 میتونید رمز رو بعد از بررسی حذف کنید.",
+    )
+
+
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text
+    if not password or len(password) < 4:
+        await update.message.reply_text("⚠️ رمز عبور خیلی کوتاهه. حداقل ۴ کاراکتر.")
+        return
+
+    status = await update.message.reply_text("⏳ در حال بررسی رمز عبور...")
+
+    try:
+        is_breached, count = check_password(password)
+    except Exception as e:
+        await status.edit_text(f"❌ خطا در بررسی: {e}\n\nلطفاً دوباره تلاش کنید.")
+        return
+
+    masked = password[:2] + "*" * (len(password) - 4) + password[-2:] if len(password) > 4 else "****"
+
+    if is_breached:
+        text = (
+            f"🔴 خطر! رمز شما نشت کرده!\n\n"
+            f"🔑 رمز: {masked}\n"
+            f"⚠️ تعداد دفعات نشت: {count:,} بار\n"
+            f"📊 سطح خطر: {strength_bar(count)}\n\n"
+            f"💡 توصیه‌ها:\n"
+            f"• همین الان رمز رو عوض کنید\n"
+            f"• از رمز یکسان همه جا استفاده نکنید\n"
+            f"• از رمز عبور قوی استفاده کنید\n"
+            f"• از رمز عبور قوی استفاده کنید"
         )
-        return
-    await do_create(update.message, cid)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔐 ساخت رمز قوی", callback_data="generate")],
+            [InlineKeyboardButton("🔄 بررسی رمز دیگر", callback_data="check")],
+            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
+        ])
+    else:
+        text = (
+            f"✅ عالی! رمز شما نشت نکرده!\n\n"
+            f"🔑 رمز: {masked}\n"
+            f"📊 تعداد نشت: ۰ بار\n\n"
+            f"💡 اما باز هم مراقب باشید:\n"
+            f"• از رمز یکسان همه جا استفاده نکنید\n"
+            f"• هر چند ماه رمز رو عوض کنید\n"
+            f"• از احراز هویت دو مرحله‌ای استفاده کنید"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 بررسی رمز دیگر", callback_data="check")],
+            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
+        ])
 
-
-async def inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    s = get_s(cid)
-    if not s:
-        await update.message.reply_text("⚠️ ایمیل فعالی ندارید. /newmail", reply_markup=main_menu())
-        return
-    await do_inbox(update.message, cid, s)
+    await status.edit_text(text, reply_markup=kb)
 
 
 async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     d = q.data
-    cid = update.effective_chat.id
 
     if d == "main_menu":
         await q.edit_message_text(WELCOME, reply_markup=main_menu())
-
-    elif d.startswith("copy_"):
-        code = d.replace("copy_", "")
-        await q.answer(f"✅ کد {code} کپی شد!\nحالا در سایت Paste کنید", show_alert=True)
 
     elif d == "help":
         await q.edit_message_text(HELP, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🏠 منو", callback_data="main_menu")]
         ]))
 
-    elif d == "newmail":
-        s = get_s(cid)
-        if s:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ حذف و ساخت جدید", callback_data="delete_and_new"),
-                 InlineKeyboardButton("❌ انصراف", callback_data="cancel")],
-            ])
-            await q.edit_message_text(
-                f"⚠️ ایمیل فعال دارید:\n📧 {s['address']}\n\nحذف و جدید بسازید؟", reply_markup=kb,
-            )
-            return
-        status = await q.edit_message_text("⏳ در حال ساخت ایمیل...")
-        try:
-            addr, sid, seq = await guerrilla_create()
-            set_s(cid, {
-                "backend": "guerrillamail",
-                "address": addr,
-                "sid": sid,
-                "seq": seq,
-                "count": 0,
-            })
-            auto_fetch_jobs[cid] = True
-            text = (
-                f"✅ ایمیل موقت ساخته شد!\n\n"
-                f"📧 آدرس ایمیل:\n"
-                f"<code>{addr}</code>\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 مراحل کار:\n\n"
-                f"۱. آدرس بالا رو کپی کنید\n"
-                f"۲. در سایت مورد نظر ثبت‌نام کنید\n"
-                f"۳. ایمیل تأیید ارسال میشه\n"
-                f"۴. ربات خودکار کد/لینک رو میفرسته\n\n"
-                f"⏱️ اعتبار: ۱ ساعت\n"
-                f"🔄 دریافت خودکار: هر ۳۰ ثانیه"
-            )
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 کپی آدرس ایمیل", callback_data="copy_email")],
-                [InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox")],
-            ])
-            await status.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception as e:
-            await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
+    elif d == "check":
+        await q.edit_message_text(
+            "🔍 رمز عبور خود را وارد کنید:\n\n"
+            "⚠️ رمز شما ذخیره نمیشه.",
+        )
 
-    elif d == "delete_and_new":
-        clear_s(cid)
-        auto_fetch_jobs.pop(cid, None)
-        status = await q.edit_message_text("⏳ در حال ساخت ایمیل...")
-        try:
-            addr, sid, seq = await guerrilla_create()
-            set_s(cid, {
-                "backend": "guerrillamail",
-                "address": addr,
-                "sid": sid,
-                "seq": seq,
-                "count": 0,
-            })
-            auto_fetch_jobs[cid] = True
-            text = (
-                f"✅ ایمیل موقت ساخته شد!\n\n"
-                f"📧 آدرس ایمیل:\n"
-                f"<code>{addr}</code>\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 مراحل کار:\n\n"
-                f"۱. آدرس بالا رو کپی کنید\n"
-                f"۲. در سایت مورد نظر ثبت‌نام کنید\n"
-                f"۳. ایمیل تأیید ارسال میشه\n"
-                f"۴. ربات خودکار کد/لینک رو میفرسته\n\n"
-                f"⏱️ اعتبار: ۱ ساعت\n"
-                f"🔄 دریافت خودکار: هر ۳۰ ثانیه"
-            )
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 کپی آدرس ایمیل", callback_data="copy_email")],
-                [InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox")],
-            ])
-            await status.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception as e:
-            await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
-
-    elif d == "copy_email":
-        s = get_s(cid)
-        if s:
-            await q.answer(f"📧 {s['address']}", show_alert=True)
-        else:
-            await q.answer("⚠️ ایمیلی نیست", show_alert=True)
-
-    elif d == "cancel":
-        await q.edit_message_text("✅ لغو شد.", reply_markup=main_menu())
-
-    elif d == "delete":
-        s = get_s(cid)
-        if not s:
-            await q.edit_message_text("⚠️ ایمیلی نیست.", reply_markup=main_menu())
-            return
+    elif d == "generate":
+        pwd = generate_password()
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ بله", callback_data="confirm_delete"),
-             InlineKeyboardButton("❌ انصراف", callback_data="cancel")],
+            [InlineKeyboardButton("🔄 رمز جدید", callback_data="generate")],
+            [InlineKeyboardButton("🔍 بررسی این رمز", callback_data=f"verify_{pwd}")],
+            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
         ])
-        await q.edit_message_text(f"⚠️ حذف ایمیل؟\n\n📧 {s['address']}", reply_markup=kb)
+        await q.edit_message_text(
+            f"🔐 رمز عبور قوی شما:\n\n"
+            f"🔑 رمز:\n<code>{pwd}</code>\n\n"
+            f"📊 قدرت: بسیار قوی 💪\n"
+            f"📏 طول: {len(pwd)} کاراکتر\n\n"
+            f"💡 نکته: این رمز رو جایی ذخیره کنید",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
 
-    elif d == "confirm_delete":
-        clear_s(cid)
-        auto_fetch_jobs.pop(cid, None)
-        await q.edit_message_text("✅ حذف شد.", reply_markup=main_menu())
-
-    elif d == "inbox":
-        s = get_s(cid)
-        if not s:
-            await q.edit_message_text("⚠️ ایمیل فعالی ندارید.")
-            return
-        status = await q.edit_message_text("⏳ در حال بررسی صندوق...")
+    elif d.startswith("verify_"):
+        pwd = d.replace("verify_", "")
+        status = await q.edit_message_text("⏳ در حال بررسی...")
         try:
-            msgs, _ = await guerrilla_check(s["sid"], s.get("seq", 0))
-            if not msgs:
+            is_breached, count = check_password(pwd)
+            masked = pwd[:2] + "*" * (len(pwd) - 4) + pwd[-2:] if len(pwd) > 4 else "****"
+            if is_breached:
+                text = (
+                    f"🔴 خطر! رمز نشت کرده!\n\n"
+                    f"🔑 رمز: {masked}\n"
+                    f"⚠️ تعداد دفعات نشت: {count:,} بار\n"
+                    f"📊 سطح خطر: {strength_bar(count)}\n\n"
+                    f"💡 یه رمز دیگه بسازید!"
+                )
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
+                    [InlineKeyboardButton("🔐 ساخت رمز جدید", callback_data="generate")],
                     [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
                 ])
-                await status.edit_text(
-                    f"📭 خالی است\n\n📧 {s['address']}\n\n"
-                    "🔄 دریافت خودکار فعال است.\n"
-                    "ایمیل تأیید به این آدرس ارسال بشه، خودکار دریافت میشه.",
-                    reply_markup=kb,
-                )
-                return
-
-            new_count = len(msgs) - s.get("count", 0)
-            s["count"] = len(msgs)
-            lines = [f"📬 {len(msgs)} ایمیل:\n"]
-            if new_count > 0:
-                lines.insert(0, f"🔔 {new_count} جدید!\n")
-
-            buttons = []
-            for i, m in enumerate(msgs[:10], 1):
-                fr = m.get("mail_from", "")
-                subj = m.get("mail_subject", "")
-                lines.append(f"{i}. 📩 {subj}\n   👤 {fr}")
-                buttons.append([InlineKeyboardButton(f"📩 {subj[:35]}", callback_data=f"read_{i-1}")])
-
-            buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
-            buttons.append([InlineKeyboardButton("🏠 منو", callback_data="main_menu")])
-            await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-        except Exception as e:
-            await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
-
-    elif d.startswith("read_"):
-        s = get_s(cid)
-        if not s:
-            await q.edit_message_text("⚠️ ایمیلی نیست.")
-            return
-        try:
-            msgs, _ = await guerrilla_check(s["sid"], s.get("seq", 0))
-            if d == "read_latest":
-                if not msgs:
-                    await q.edit_message_text("📭 خالی.")
-                    return
-                m = msgs[0]
             else:
-                idx = int(d.split("_")[1])
-                if idx >= len(msgs):
-                    await q.edit_message_text("❌ یافت نشد.")
-                    return
-                m = msgs[idx]
-
-            eid = m.get("mail_id")
-            detail = await guerrilla_fetch(s["sid"], eid)
-            text, kb = fmt_detail(detail)
-            await q.edit_message_text(text, reply_markup=kb)
-        except Exception as e:
-            await q.edit_message_text(f"❌ خطا: {e}")
-
-    elif d == "back_inbox":
-        s = get_s(cid)
-        if not s:
-            await q.edit_message_text("⚠️ ایمیلی نیست.")
-            return
-        status = await q.edit_message_text("⏳ در حال بررسی...")
-        try:
-            msgs, _ = await guerrilla_check(s["sid"], s.get("seq", 0))
-            if not msgs:
+                text = (
+                    f"✅ عالی! رمز نشت نکرده!\n\n"
+                    f"🔑 رمز: {masked}\n"
+                    f"📊 تعداد نشت: ۰ بار\n\n"
+                    f"💡 میتونید از این رمز استفاده کنید."
+                )
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
+                    [InlineKeyboardButton("🔄 رمز دیگر", callback_data="generate")],
                     [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
                 ])
-                await status.edit_text(
-                    f"📭 خالی است\n\n📧 {s['address']}", reply_markup=kb,
-                )
-                return
-
-            lines = [f"📬 {len(msgs)} ایمیل:\n"]
-            buttons = []
-            for i, m in enumerate(msgs[:10], 1):
-                fr = m.get("mail_from", "")
-                subj = m.get("mail_subject", "")
-                lines.append(f"{i}. 📩 {subj}\n   👤 {fr}")
-                buttons.append([InlineKeyboardButton(f"📩 {subj[:35]}", callback_data=f"read_{i-1}")])
-
-            buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
-            buttons.append([InlineKeyboardButton("🏠 منو", callback_data="main_menu")])
-            await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+            await status.edit_text(text, reply_markup=kb)
         except Exception as e:
             await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
 
-    elif d == "refresh_inbox":
-        s = get_s(cid)
-        if not s:
-            await q.edit_message_text("⚠️ ایمیلی نیست.")
-            return
-        status = await q.edit_message_text("⏳ در حال بررسی...")
+    elif d == "stats":
         try:
-            msgs, _ = await guerrilla_check(s["sid"], s.get("seq", 0))
-            if not msgs:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
-                    [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
-                ])
-                await status.edit_text(
-                    f"📭 خالی است\n\n📧 {s['address']}\n\n🔄 دریافت خودکار فعال است.", reply_markup=kb,
-                )
-                return
+            r = httpx.get("https://haveibeenpwned.com/api/v3/breaches", timeout=10,
+                          headers={"user-agent": "PwnedPasswordBot/1.0"})
+            if r.status_code == 200:
+                breaches = r.json()
+                total_breaches = len(breaches)
+                total_accounts = sum(b.get("PwnCount", 0) for b in breaches)
+                recent = sorted(breaches, key=lambda x: x.get("AddedDate", ""), reverse=True)[:5]
+                text = "📊 آمار نشت اطلاعات جهانی\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                text += f"🌐 تعداد کل نشت‌ها: {total_breaches:,}\n"
+                text += f"👥 تعداد کل اکانت‌ها: {total_accounts:,}\n\n"
+                text += "📅 آخرین نشت‌ها:\n"
+                for b in recent:
+                    name = b.get("Title", "ناشناس")
+                    count = b.get("PwnCount", 0)
+                    date = b.get("BreachDate", "ناشناس")
+                    text += f"  • {name}: {count:,} اکانت ({date})\n"
+                text += "\n💡 همین الان رمزتون رو بررسی کنید!"
+            else:
+                text = "📊 آمار در دسترس نیست.\n\n💡 همین الان رمزتون رو بررسی کنید!"
+        except Exception:
+            text = "📊 آمار در دسترس نیست.\n\n💡 همین الان رمزتون رو بررسی کنید!"
 
-            new_count = len(msgs) - s.get("count", 0)
-            s["count"] = len(msgs)
-            lines = [f"📬 {len(msgs)} ایمیل:\n"]
-            if new_count > 0:
-                lines.insert(0, f"🔔 {new_count} جدید!\n")
-
-            buttons = []
-            for i, m in enumerate(msgs[:10], 1):
-                fr = m.get("mail_from", "")
-                subj = m.get("mail_subject", "")
-                lines.append(f"{i}. 📩 {subj}\n   👤 {fr}")
-                buttons.append([InlineKeyboardButton(f"📩 {subj[:35]}", callback_data=f"read_{i-1}")])
-
-            buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
-            buttons.append([InlineKeyboardButton("🏠 منو", callback_data="main_menu")])
-            await status.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-        except Exception as e:
-            await status.edit_text(f"❌ خطا: {e}", reply_markup=main_menu())
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 بررسی رمز", callback_data="check")],
+            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
+        ])
+        await q.edit_message_text(text, reply_markup=kb)
 
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("newmail", newmail))
-    app.add_handler(CommandHandler("inbox", inbox))
+    app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(CommandHandler("generate", lambda u, c: cb(
+        Update(update_id=0, callback_query=None), c) if False else None))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(cb))
-
-    app.job_queue.run_repeating(auto_check, interval=30, first=5)
 
     logger.info("Bot started!")
     print("Bot running...")
