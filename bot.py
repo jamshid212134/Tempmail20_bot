@@ -2,10 +2,8 @@ import random
 import string
 import re
 import logging
-import json
 import html as html_mod
 from datetime import datetime
-from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,7 +12,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from config import BOT_TOKEN
-import atomicmail_client as am
+import mailtm_client as mail
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -22,6 +20,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+BASE_URL = "https://api.mail.tm"
 user_sessions: dict[int, dict] = {}
 auto_fetch_jobs: dict[int, bool] = {}
 
@@ -37,8 +36,9 @@ def extract_verification_code(text: str) -> str | None:
     lines = plain.split("\n")
     keywords = [
         "verification code", "your code", "code is", "code:",
-        "enter code", "use code", "otp code",
-        "کد تایید", "کد تأیید", "کد شما", "کد ورود",
+        "enter code", "use code", "otp code", "verification pin",
+        "your pin", "pin is", "pin code",
+        "کد تایید", "کد تأیید", "کد شما", "کد ورود", "کد فعال‌سازی",
     ]
     for line in lines:
         line = line.strip()
@@ -113,31 +113,6 @@ def clear_session(chat_id: int):
     user_sessions.pop(chat_id, None)
 
 
-_CHAT_IDS_FILE = Path.home() / ".atomicmail" / "chat_ids.json"
-
-
-def _save_chat_id(username: str, chat_id: int):
-    _CHAT_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {}
-    if _CHAT_IDS_FILE.exists():
-        try:
-            data = json.loads(_CHAT_IDS_FILE.read_text())
-        except Exception:
-            pass
-    data[str(chat_id)] = username
-    _CHAT_IDS_FILE.write_text(json.dumps(data))
-
-
-def _load_chat_ids() -> dict[int, str]:
-    if not _CHAT_IDS_FILE.exists():
-        return {}
-    try:
-        data = json.loads(_CHAT_IDS_FILE.read_text())
-        return {int(k): v for k, v in data.items()}
-    except Exception:
-        return {}
-
-
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -149,20 +124,21 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗑️ حذف ایمیل", callback_data="delete"),
         ],
         [
+            InlineKeyboardButton("🌐 دامنه‌ها", callback_data="domains"),
             InlineKeyboardButton("📖 راهنما", callback_data="help"),
         ],
     ])
 
 
-WELCOME_MSG = """🎯 ربات ایمیل موقت حرفه‌ای (Atomic Mail)
+WELCOME_MSG = """🎯 ربات ایمیل موقت حرفه‌ای
 
-✨ با این ربات می‌توانید ایمیل واقعی رایگان بسازید
+✨ با این ربات می‌توانید ایمیل موقت رایگان بسازید
 و برای ثبت‌نام در سایت‌ها استفاده کنید.
 
 🔒 ویژگی‌ها:
-  • ایمیل واقعی @atomicmail.ai
   • دریافت خودکار ایمیل تأیید
   • نمایش تمام لینک‌های ایمیل
+  • دامنه‌های متنوع
   • تشخیص خودکار کد تأیید
 
 📋 منوی اصلی:"""
@@ -177,7 +153,6 @@ HELP_MSG = """📖 راهنمای ربات
 🔹 /password - نمایش رمز عبور
 🔹 /delete - حذف ایمیل فعلی
 🔹 /stop - توقف دریافت خودکار
-🔹 /restart - راه‌اندازی مجدد خودکار
 
 💡 نکته: ایمیل‌ها خودکار بررسی می‌شوند.
 کد تأیید و لینک‌ها خودکار شناسایی می‌شوند."""
@@ -212,29 +187,43 @@ async def show_creation_status(update, chat_id):
     status_msg = await update.message.reply_text("⏳ در حال ساخت ایمیل موقت...")
     try:
         username = generate_random_username()
-        logger.info(f"Registering new account: {username}")
-        creds = await am.register(username)
+        password = mail.generate_random_password()
+        domains = await mail.get_available_domains()
+        if not domains:
+            await status_msg.edit_text(
+                "❌ خطا: دامنه‌ای موجود نیست.",
+                reply_markup=build_main_menu_keyboard(),
+            )
+            return
+        domain = random.choice(domains)
+        address = f"{username}@{domain}"
+        await mail.create_account(address, password)
+        token = await mail.get_token(address, password)
         set_session(chat_id, {
-            "address": creds["address"],
-            "api_key": creds["api_key"],
-            "account_id": creds["account_id"],
+            "address": address,
+            "password": password,
+            "token": token,
             "username": username,
+            "domain": domain,
             "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
-        _save_chat_id(username, chat_id)
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{creds['address']}</code>\n\n"
-            "⏰ اعتبار: دائمی\n"
+            f"📧 آدرس:\n<code>{address}</code>\n\n"
+            f"🔑 رمز:\n<code>{password}</code>\n\n"
+            "⏰ اعتبار: ۷ روز\n"
             "🔄 دریافت خودکار: فعال\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📌 در سایت ثبت‌نام کنید.\n"
             "ایمیل‌ها خودکار بررسی می‌شوند."
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
+            [
+                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
+                InlineKeyboardButton("📋 کپی رمز", callback_data="copy_pass"),
+            ],
             [
                 InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
                 InlineKeyboardButton("🗑️ حذف", callback_data="delete"),
@@ -270,36 +259,38 @@ async def custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not all(c.isalnum() or c in "-_." for c in custom_username):
         await update.message.reply_text("❌ نام نامعتبر است.", reply_markup=build_main_menu_keyboard())
         return
-    if len(custom_username) < 5 or len(custom_username) > 21:
-        await update.message.reply_text(
-            "❌ نام باید بین ۵ تا ۲۱ کاراکتر باشد.",
-            reply_markup=build_main_menu_keyboard(),
-        )
-        return
     status_msg = await update.message.reply_text("⏳ در حال ساخت ایمیل...")
     try:
-        creds = await am.register(custom_username)
+        password = mail.generate_random_password()
+        domains = await mail.get_available_domains()
+        if not domains:
+            await status_msg.edit_text("❌ خطا: دامنه‌ای موجود نیست.", reply_markup=build_main_menu_keyboard())
+            return
+        domain = random.choice(domains)
+        address = f"{custom_username}@{domain}"
+        await mail.create_account(address, password)
+        token = await mail.get_token(address, password)
         set_session(chat_id, {
-            "address": creds["address"],
-            "api_key": creds["api_key"],
-            "account_id": creds["account_id"],
-            "username": username,
-            "message_count": 0,
+            "address": address, "password": password, "token": token,
+            "username": custom_username, "domain": domain, "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
-        _save_chat_id(username, chat_id)
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{creds['address']}</code>\n\n"
-            "⏰ اعتبار: دائمی\n"
+            f"📧 آدرس:\n<code>{address}</code>\n\n"
+            f"🔑 رمز:\n<code>{password}</code>\n\n"
+            "⏰ اعتبار: ۷ روز\n"
             "🔄 دریافت خودکار: فعال\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📌 در سایت ثبت‌نام کنید.\n"
             "ایمیل‌ها خودکار بررسی می‌شوند."
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
+            [
+                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
+                InlineKeyboardButton("📋 کپی رمز", callback_data="copy_pass"),
+            ],
             [
                 InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
                 InlineKeyboardButton("🗑️ حذف", callback_data="delete"),
@@ -326,7 +317,7 @@ async def show_inbox(update_or_query, chat_id, session):
     else:
         msg = await update_or_query.edit_message_text("⏳ در حال بررسی صندوق...")
     try:
-        messages = await am.get_messages(session["username"], session["account_id"])
+        messages = await mail.get_messages(session["token"])
         if not messages:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
@@ -346,9 +337,9 @@ async def show_inbox(update_or_query, chat_id, session):
             lines.insert(0, f"🔔 {new_count} ایمیل جدید!\n")
         buttons = []
         for i, m in enumerate(messages[:10], 1):
-            sender = am.extract_sender(m)
+            sender = m.get("from", {}).get("address", "ناشناس")
             subject = m.get("subject", "(بدون موضوع)")
-            created = m.get("receivedAt", "")[:10]
+            created = m.get("createdAt", "")[:10]
             lines.append(f"{i}. 📩 {subject}\n   👤 {sender} | 📅 {created}")
             buttons.append([InlineKeyboardButton(f"📩 {subject[:35]}", callback_data=f"read_{i-1}")])
         buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
@@ -370,15 +361,15 @@ async def read(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         msg_index = int(context.args[0]) - 1
-        messages = await am.get_messages(session["username"], session["account_id"])
+        messages = await mail.get_messages(session["token"])
         if not messages:
             await update.message.reply_text("📭 صندوق خالی است.")
             return
         if msg_index < 0 or msg_index >= len(messages):
             await update.message.reply_text(f"❌ شماره ۱ تا {len(messages)}")
             return
-        email_id = messages[msg_index]["id"]
-        detail = await am.get_email_detail(session["username"], session["account_id"], email_id)
+        msg_id = messages[msg_index]["id"]
+        detail = await mail.get_message_detail(session["token"], msg_id)
         await show_email_detail(update, detail)
     except ValueError:
         await update.message.reply_text("❌ شماره نامعتبر.")
@@ -387,10 +378,10 @@ async def read(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_email_detail(update_or_query, detail):
-    sender = am.extract_sender(detail)
+    sender = detail.get("from", {}).get("address", "ناشناس")
     subject = detail.get("subject", "(بدون موضوع)")
-    text = am.extract_text_from_email(detail)
-    created = detail.get("receivedAt", "")[:16].replace("T", " ")
+    text = detail.get("text") or detail.get("html") or ""
+    created = detail.get("createdAt", "")[:16].replace("T", " ")
 
     code = extract_verification_code(text)
     links = extract_link_context(text)
@@ -447,12 +438,10 @@ async def password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔑 رمز ایمیل شما\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📧 آدرس:\n<code>{session['address']}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💡 ایمیل @atomicmail.ai نیاز به رمز جداگانه ندارد.\n"
-        "فقط آدرس ایمیل را کپی کنید."
+        f"🔑 رمز:\n<code>{session['password']}</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
         [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
     ])
     await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
@@ -476,33 +465,30 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_msg = await update.message.reply_text("⏳ دریافت دامنه‌ها...")
+    try:
+        domain_list = await mail.get_available_domains()
+        if not domain_list:
+            await status_msg.edit_text("❌ دامنه‌ای نیست.", reply_markup=build_main_menu_keyboard())
+            return
+        msg = "🌐 دامنه‌ها\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        for i, d in enumerate(domain_list, 1):
+            msg += f"  {i}. {d}\n"
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━\n📊 مجموع: {len(domain_list)}"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📧 ساخت ایمیل", callback_data="newmail")],
+            [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
+        ])
+        await status_msg.edit_text(msg, reply_markup=keyboard)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
+
+
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     auto_fetch_jobs[chat_id] = False
     await update.message.reply_text("✅ دریافت خودکار متوقف شد.", reply_markup=build_main_menu_keyboard())
-
-
-async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    session = get_session(chat_id)
-    if not session:
-        await update.message.reply_text(
-            "⚠️ ایمیل فعالی ندارید. ابتدا /newmail بزنید.",
-            reply_markup=build_main_menu_keyboard(),
-        )
-        return
-    auto_fetch_jobs[chat_id] = True
-    try:
-        messages = await am.get_messages(session["username"], session["account_id"])
-        session["message_count"] = len(messages)
-    except Exception:
-        pass
-    await update.message.reply_text(
-        "✅ دریافت خودکار فعال شد!\n"
-        f"📧 {session['address']}\n"
-        "🔄 هر ۱۰ ثانیه صندوق بررسی می‌شود.",
-        reply_markup=build_main_menu_keyboard(),
-    )
 
 
 async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
@@ -513,30 +499,23 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
         if not session:
             auto_fetch_jobs.pop(chat_id, None)
             continue
-        username = session.get("username")
-        account_id = session.get("account_id")
-        if not username or not account_id:
-            logger.warning(f"Auto-check: no username/account_id for chat {chat_id}")
-            continue
         try:
-            messages = await am.get_messages(username, account_id)
+            messages = await mail.get_messages(session["token"])
             current_count = len(messages)
             last_count = session.get("message_count", 0)
 
             if last_count == 0 and current_count > 0:
                 session["message_count"] = current_count
-                logger.info(f"Auto-check: initialized count={current_count} for {username}")
                 continue
 
             if current_count > last_count:
                 new_messages = messages[:current_count - last_count]
                 session["message_count"] = current_count
-                logger.info(f"Auto-check: {len(new_messages)} new emails for {username}")
                 for m in new_messages:
-                    sender = am.extract_sender(m)
+                    sender = m.get("from", {}).get("address", "ناشناس")
                     subject = m.get("subject", "(بدون موضوع)")
-                    detail = await am.get_email_detail(username, account_id, m["id"])
-                    text = am.extract_text_from_email(detail)
+                    detail = await mail.get_message_detail(session["token"], m["id"])
+                    text = detail.get("text") or detail.get("html") or ""
                     code = extract_verification_code(text)
                     links = extract_link_context(text)
 
@@ -571,10 +550,8 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup(buttons),
                     )
-            else:
-                logger.debug(f"Auto-check: no new emails for {username} (count={current_count})")
         except Exception as e:
-            logger.error(f"Auto-check error for {username}: {e}", exc_info=True)
+            logger.error(f"Auto-check error: {e}")
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -608,6 +585,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "delete_and_new":
         session = get_session(chat_id)
         if session:
+            try:
+                await mail.delete_account(session["token"])
+            except Exception:
+                pass
             clear_session(chat_id)
             auto_fetch_jobs.pop(chat_id, None)
         await show_creation_status_from_callback(query, chat_id)
@@ -620,7 +601,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ ایمیلی نیست", show_alert=True)
 
     elif data == "copy_pass":
-        await query.answer("💡 ایمیل @atomicmail.ai نیاز به رمز ندارد.", show_alert=True)
+        session = get_session(chat_id)
+        if session:
+            await query.answer(f"🔑 {session['password']}", show_alert=True)
+        else:
+            await query.answer("⚠️ ایمیلی نیست", show_alert=True)
 
     elif data == "cancel":
         await query.edit_message_text("✅ لغو شد.", reply_markup=build_main_menu_keyboard())
@@ -628,6 +613,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "confirm_delete":
         session = get_session(chat_id)
         if session:
+            try:
+                await mail.delete_account(session["token"])
+            except Exception:
+                pass
             clear_session(chat_id)
             auto_fetch_jobs.pop(chat_id, None)
             await query.edit_message_text("✅ حذف شد.", reply_markup=build_main_menu_keyboard())
@@ -647,11 +636,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not session:
                 await query.edit_message_text("⚠️ ایمیل فعالی ندارید.")
                 return
-            messages = await am.get_messages(session["username"], session["account_id"])
+            messages = await mail.get_messages(session["token"])
             if not messages:
                 await query.edit_message_text("📭 خالی.")
                 return
-            detail = await am.get_email_detail(session["username"], session["account_id"], messages[0]["id"])
+            detail = await mail.get_message_detail(session["token"], messages[0]["id"])
             await show_email_detail_from_callback(query, detail)
         else:
             msg_index = int(data.split("_")[1])
@@ -660,11 +649,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ ایمیل فعالی ندارید.")
                 return
             try:
-                messages = await am.get_messages(session["username"], session["account_id"])
+                messages = await mail.get_messages(session["token"])
                 if msg_index >= len(messages):
                     await query.edit_message_text("❌ یافت نشد.")
                     return
-                detail = await am.get_email_detail(session["username"], session["account_id"], messages[msg_index]["id"])
+                detail = await mail.get_message_detail(session["token"], messages[msg_index]["id"])
                 await show_email_detail_from_callback(query, detail)
             except Exception as e:
                 await query.edit_message_text(f"❌ خطا: {str(e)}")
@@ -683,6 +672,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await show_inbox_from_callback(query, chat_id, session)
 
+    elif data == "domains":
+        try:
+            domain_list = await mail.get_available_domains()
+            if not domain_list:
+                await query.edit_message_text("❌ دامنه‌ای نیست.", reply_markup=build_main_menu_keyboard())
+                return
+            msg = "🌐 دامنه‌ها\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            for i, d in enumerate(domain_list, 1):
+                msg += f"  {i}. {d}\n"
+            msg += f"\n━━━━━━━━━━━━━━━━━━━━\n📊 مجموع: {len(domain_list)}"
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📧 ساخت ایمیل", callback_data="newmail")],
+                [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
+            ])
+            await query.edit_message_text(msg, reply_markup=keyboard)
+        except Exception as e:
+            await query.edit_message_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
+
     elif data == "stop":
         auto_fetch_jobs[chat_id] = False
         await query.edit_message_text("✅ متوقف شد.", reply_markup=build_main_menu_keyboard())
@@ -692,29 +699,36 @@ async def show_creation_status_from_callback(query, chat_id):
     status_msg = await query.edit_message_text("⏳ در حال ساخت ایمیل...")
     try:
         username = generate_random_username()
-        logger.info(f"Registering new account from callback: {username}")
-        creds = await am.register(username)
+        password = mail.generate_random_password()
+        domains = await mail.get_available_domains()
+        if not domains:
+            await status_msg.edit_text("❌ دامنه‌ای نیست.", reply_markup=build_main_menu_keyboard())
+            return
+        domain = random.choice(domains)
+        address = f"{username}@{domain}"
+        await mail.create_account(address, password)
+        token = await mail.get_token(address, password)
         set_session(chat_id, {
-            "address": creds["address"],
-            "api_key": creds["api_key"],
-            "account_id": creds["account_id"],
-            "username": username,
-            "message_count": 0,
+            "address": address, "password": password, "token": token,
+            "username": username, "domain": domain, "message_count": 0,
         })
         auto_fetch_jobs[chat_id] = True
-        _save_chat_id(username, chat_id)
         success_msg = (
             "✅ ایمیل موقت شما ساخته شد!\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📧 آدرس:\n<code>{creds['address']}</code>\n\n"
-            "⏰ اعتبار: دائمی\n"
+            f"📧 آدرس:\n<code>{address}</code>\n\n"
+            f"🔑 رمز:\n<code>{password}</code>\n\n"
+            "⏰ اعتبار: ۷ روز\n"
             "🔄 دریافت خودکار: فعال\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📌 در سایت ثبت‌نام کنید.\n"
             "ایمیل‌ها خودکار بررسی می‌شوند."
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email")],
+            [
+                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
+                InlineKeyboardButton("📋 کپی رمز", callback_data="copy_pass"),
+            ],
             [
                 InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
                 InlineKeyboardButton("🗑️ حذف", callback_data="delete"),
@@ -728,7 +742,7 @@ async def show_creation_status_from_callback(query, chat_id):
 async def show_inbox_from_callback(query, chat_id, session):
     await query.edit_message_text("⏳ در حال بررسی...")
     try:
-        messages = await am.get_messages(session["username"], session["account_id"])
+        messages = await mail.get_messages(session["token"])
         if not messages:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
@@ -745,9 +759,9 @@ async def show_inbox_from_callback(query, chat_id, session):
             lines.insert(0, f"🔔 {new_count} جدید!\n")
         buttons = []
         for i, m in enumerate(messages[:10], 1):
-            sender = am.extract_sender(m)
+            sender = m.get("from", {}).get("address", "ناشناس")
             subject = m.get("subject", "(بدون موضوع)")
-            created = m.get("receivedAt", "")[:10]
+            created = m.get("createdAt", "")[:10]
             lines.append(f"{i}. 📩 {subject}\n   👤 {sender} | 📅 {created}")
             buttons.append([InlineKeyboardButton(f"📩 {subject[:35]}", callback_data=f"read_{i-1}")])
         buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
@@ -758,10 +772,10 @@ async def show_inbox_from_callback(query, chat_id, session):
 
 
 async def show_email_detail_from_callback(query, detail):
-    sender = am.extract_sender(detail)
+    sender = detail.get("from", {}).get("address", "ناشناس")
     subject = detail.get("subject", "(بدون موضوع)")
-    text = am.extract_text_from_email(detail)
-    created = detail.get("receivedAt", "")[:16].replace("T", " ")
+    text = detail.get("text") or detail.get("html") or ""
+    created = detail.get("createdAt", "")[:16].replace("T", " ")
 
     code = extract_verification_code(text)
     links = extract_link_context(text)
@@ -811,39 +825,16 @@ def main():
     app.add_handler(CommandHandler("read", read))
     app.add_handler(CommandHandler("password", password))
     app.add_handler(CommandHandler("delete", delete))
+    app.add_handler(CommandHandler("domains", domains))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("restart", restart))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     job_queue = app.job_queue
     job_queue.run_repeating(auto_check_inbox, interval=10, first=5)
-    job_queue.run_once(_startup_restore, 1)
 
     logger.info("🚀 ربات شروع به کار کرد!")
     print("✅ ربات در حال اجراست...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-async def _startup_restore(context: ContextTypes.DEFAULT_TYPE):
-    chat_id_map = _load_chat_ids()
-    if not chat_id_map:
-        logger.info("No saved chat IDs to restore")
-        return
-    for chat_id, username in chat_id_map.items():
-        try:
-            client = await am.get_client(username)
-            if client._account_id:
-                set_session(chat_id, {
-                    "address": f"{username}@atomicmail.ai",
-                    "api_key": client._api_key,
-                    "account_id": client._account_id,
-                    "username": username,
-                    "message_count": 0,
-                })
-                auto_fetch_jobs[chat_id] = True
-                logger.info(f"Restored auto-check for {username} (chat={chat_id})")
-        except Exception as e:
-            logger.error(f"Failed to restore {username}: {e}")
 
 
 if __name__ == "__main__":
