@@ -29,7 +29,7 @@ def extract_verification_code(text: str) -> str | None:
     lines = plain.split("\n")
     keywords = [
         "verification code", "your code", "code is", "code:",
-        "enter code", "use code", "otp code",
+        "enter code", "use code", "otp code", "launch code",
         "کد تایید", "کد تأیید", "کد شما", "کد ورود",
     ]
     for line in lines:
@@ -188,6 +188,29 @@ HELP_MSG = """📖 راهنمای ربات
 نمایش داده می‌شوند تا خودتان انتخاب کنید."""
 
 
+def format_new_email(sender: str, subject: str, code: str | None, links: list) -> str:
+    safe_sender = html_mod.escape(str(sender))
+    safe_subject = html_mod.escape(str(subject))
+
+    msg = (
+        "📩 ایمیل جدید دریافت شد!\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 فرستنده: {safe_sender}\n"
+        f"📌 موضوع: {safe_subject}\n"
+    )
+
+    if code:
+        msg += f"\n🔑 کد تأیید: <code>{html_mod.escape(code)}</code>\n"
+
+    if links:
+        msg += f"\n🔗 لینک‌ها ({len(links)}):\n"
+        for i, (desc, link) in enumerate(links, 1):
+            msg += f"{i}. {desc}\n"
+
+    msg += "\n━━━━━━━━━━━━━━━━━━━━\n💡 لینک مورد نظر را انتخاب کنید:"
+    return msg
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         WELCOME_MSG, reply_markup=build_main_menu_keyboard()
@@ -210,14 +233,11 @@ async def newmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard,
         )
         return
-    await show_creation_status(update, chat_id)
+    await create_new_email(update.message, chat_id)
 
 
-async def show_creation_status(update_or_query, chat_id):
-    if hasattr(update_or_query, "message"):
-        status_msg = await update_or_query.message.reply_text("⏳ در حال ساخت ایمیل موقت...")
-    else:
-        status_msg = update_or_query
+async def create_new_email(msg, chat_id):
+    status_msg = await msg.reply_text("⏳ در حال ساخت ایمیل موقت...")
     try:
         data = await guerrilla_create()
         address = data["address"]
@@ -255,14 +275,11 @@ async def inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not session:
         await update.message.reply_text("⚠️ ایمیل فعالی ندارید. /newmail", reply_markup=build_main_menu_keyboard())
         return
-    await show_inbox(update, chat_id, session)
+    await show_inbox(update.message, chat_id, session)
 
 
-async def show_inbox(update_or_query, chat_id, session):
-    if hasattr(update_or_query, "message"):
-        msg = await update_or_query.message.reply_text("⏳ در حال بررسی صندوق...")
-    else:
-        msg = await update_or_query.edit_message_text("⏳ در حال بررسی صندوق...")
+async def show_inbox(msg, chat_id, session):
+    status_msg = await msg.reply_text("⏳ در حال بررسی صندوق...")
     try:
         messages = await guerrilla_check(session["sid_token"])
         if not messages:
@@ -270,7 +287,7 @@ async def show_inbox(update_or_query, chat_id, session):
                 [InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")],
                 [InlineKeyboardButton("🏠 منو", callback_data="main_menu")],
             ])
-            await msg.edit_text(
+            await status_msg.edit_text(
                 "📭 صندوق خالی است.\n\n"
                 f"📧 {session['address']}\n\n"
                 "🔄 دریافت خودکار فعال است.",
@@ -291,61 +308,10 @@ async def show_inbox(update_or_query, chat_id, session):
             buttons.append([InlineKeyboardButton(f"📩 {subject[:35]}", callback_data=f"read_{i-1}")])
         buttons.append([InlineKeyboardButton("🔄 بروزرسانی", callback_data="refresh_inbox")])
         buttons.append([InlineKeyboardButton("🏠 منو", callback_data="main_menu")])
-        await msg.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+        await status_msg.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
     except Exception as e:
         logger.error(f"Inbox error: {e}")
-        await msg.edit_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
-
-
-async def show_email_detail(update_or_query, detail):
-    sender = detail.get("sender", "ناشناس")
-    subject = detail.get("subject", "(بدون موضوع)")
-    text = detail.get("body", "")
-    created = detail.get("date", "")
-
-    code = extract_verification_code(text)
-    links = extract_link_context(text)
-
-    safe_sender = html_mod.escape(sender)
-    safe_subject = html_mod.escape(subject)
-    safe_text = html_mod.escape(text[:2000])
-
-    response = (
-        "📩 ایمیل دریافتی\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 فرستنده: {safe_sender}\n"
-        f"📌 موضوع: {safe_subject}\n"
-        f"📅 تاریخ: {created}\n"
-    )
-
-    if code:
-        response += f"\n🔑 کد تأیید: <code>{html_mod.escape(code)}</code>\n"
-
-    if links:
-        response += f"\n🔗 لینک‌های موجود ({len(links)}):\n"
-        for i, (desc, link) in enumerate(links, 1):
-            response += f"\n{i}. {html_mod.escape(desc)}\n"
-
-    response += (
-        "\n📄 متن ایمیل:\n"
-        "─────────────\n"
-        f"{safe_text}\n"
-        "─────────────"
-    )
-
-    buttons = []
-    for i, (desc, link) in enumerate(links, 1):
-        buttons.append([InlineKeyboardButton(f"🔗 {i}. {desc[:40]}", url=link)])
-    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_inbox")])
-
-    if hasattr(update_or_query, "message"):
-        await update_or_query.message.reply_text(
-            response, reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    else:
-        await update_or_query.edit_message_text(
-            response, reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        await status_msg.edit_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,32 +336,14 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
                 new_messages = messages[:current_count - last_count]
                 session["message_count"] = current_count
                 for m in new_messages:
-                    sender = m.get("sender", "ناشناس")
-                    subject = m.get("subject", "(بدون موضوع)")
                     detail = await guerrilla_fetch(session["sid_token"], m["id"])
+                    sender = detail.get("sender", "ناشناس")
+                    subject = detail.get("subject", "(بدون موضوع)")
                     text = detail.get("body", "")
                     code = extract_verification_code(text)
                     links = extract_link_context(text)
 
-                    safe_sender = html_mod.escape(sender)
-                    safe_subject = html_mod.escape(subject)
-
-                    notify = (
-                        "📩 ایمیل جدید دریافت شد!\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"👤 فرستنده: {safe_sender}\n"
-                        f"📌 موضوع: {safe_subject}\n"
-                    )
-
-                    if code:
-                        notify += f"\n🔑 کد تأیید: <code>{html_mod.escape(code)}</code>\n"
-
-                    if links:
-                        notify += f"\n🔗 لینک‌ها ({len(links)}):\n"
-                        for i, (desc, link) in enumerate(links, 1):
-                            notify += f"{i}. {desc}\n"
-
-                    notify += "\n━━━━━━━━━━━━━━━━━━━━\n💡 لینک مورد نظر را انتخاب کنید:"
+                    notify = format_new_email(sender, subject, code, links)
 
                     buttons = []
                     for i, (desc, link) in enumerate(links, 1):
@@ -438,68 +386,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=keyboard,
             )
             return
-        status_msg = await query.edit_message_text("⏳ در حال ساخت ایمیل...")
-        try:
-            new_data = await guerrilla_create()
-            new_address = new_data["address"]
-            new_sid = new_data["sid_token"]
-            set_session(chat_id, {
-                "address": new_address,
-                "sid_token": new_sid,
-                "message_count": 0,
-            })
-            auto_fetch_jobs[chat_id] = True
-            success_msg = (
-                "✅ ایمیل موقت شما ساخته شد!\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📧 آدرس:\n<code>{new_address}</code>\n\n"
-                "🔄 دریافت خودکار: فعال\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "📌 در سایت ثبت‌نام کنید.\n"
-                "ایمیل‌ها خودکار بررسی می‌شوند."
-            )
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
-                    InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
-                ],
-            ])
-            await status_msg.edit_text(success_msg, parse_mode="HTML", reply_markup=keyboard)
-        except Exception as e:
-            await status_msg.edit_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
+        await create_new_email_callback(query, chat_id)
 
     elif data == "delete_and_new":
         clear_session(chat_id)
         auto_fetch_jobs.pop(chat_id, None)
-        status_msg = await query.edit_message_text("⏳ در حال ساخت ایمیل...")
-        try:
-            new_data = await guerrilla_create()
-            new_address = new_data["address"]
-            new_sid = new_data["sid_token"]
-            set_session(chat_id, {
-                "address": new_address,
-                "sid_token": new_sid,
-                "message_count": 0,
-            })
-            auto_fetch_jobs[chat_id] = True
-            success_msg = (
-                "✅ ایمیل موقت شما ساخته شد!\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📧 آدرس:\n<code>{new_address}</code>\n\n"
-                "🔄 دریافت خودکار: فعال\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "📌 در سایت ثبت‌نام کنید.\n"
-                "ایمیل‌ها خودکار بررسی می‌شوند."
-            )
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
-                    InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
-                ],
-            ])
-            await status_msg.edit_text(success_msg, parse_mode="HTML", reply_markup=keyboard)
-        except Exception as e:
-            await status_msg.edit_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
+        await create_new_email_callback(query, chat_id)
 
     elif data == "copy_email":
         session = get_session(chat_id)
@@ -516,7 +408,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session:
             await query.edit_message_text("⚠️ ایمیل فعالی ندارید.", reply_markup=build_main_menu_keyboard())
             return
-        await show_inbox_from_callback(query, chat_id, session)
+        await show_inbox_callback(query, chat_id, session)
 
     elif data.startswith("read_"):
         session = get_session(chat_id)
@@ -530,14 +422,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text("📭 خالی.")
                     return
                 detail = await guerrilla_fetch(session["sid_token"], messages[0]["id"])
-                await show_email_detail_from_callback(query, detail)
             else:
                 msg_index = int(data.split("_")[1])
                 if msg_index >= len(messages):
                     await query.edit_message_text("❌ یافت نشد.")
                     return
                 detail = await guerrilla_fetch(session["sid_token"], messages[msg_index]["id"])
-                await show_email_detail_from_callback(query, detail)
+            await show_email_detail_callback(query, detail)
         except Exception as e:
             await query.edit_message_text(f"❌ خطا: {str(e)}")
 
@@ -546,21 +437,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session:
             await query.edit_message_text("⚠️ ایمیل فعالی ندارید.")
             return
-        await show_inbox_from_callback(query, chat_id, session)
+        await show_inbox_callback(query, chat_id, session)
 
     elif data == "refresh_inbox":
         session = get_session(chat_id)
         if not session:
             await query.edit_message_text("⚠️ ایمیل فعالی ندارید.")
             return
-        await show_inbox_from_callback(query, chat_id, session)
+        await show_inbox_callback(query, chat_id, session)
 
     elif data == "stop":
         auto_fetch_jobs[chat_id] = False
         await query.edit_message_text("✅ متوقف شد.", reply_markup=build_main_menu_keyboard())
 
 
-async def show_inbox_from_callback(query, chat_id, session):
+async def create_new_email_callback(query, chat_id):
+    status_msg = await query.edit_message_text("⏳ در حال ساخت ایمیل...")
+    try:
+        data = await guerrilla_create()
+        address = data["address"]
+        sid_token = data["sid_token"]
+        set_session(chat_id, {
+            "address": address,
+            "sid_token": sid_token,
+            "message_count": 0,
+        })
+        auto_fetch_jobs[chat_id] = True
+        success_msg = (
+            "✅ ایمیل موقت شما ساخته شد!\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📧 آدرس:\n<code>{address}</code>\n\n"
+            "🔄 دریافت خودکار: فعال\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "📌 در سایت ثبت‌نام کنید.\n"
+            "ایمیل‌ها خودکار بررسی می‌شوند."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📋 کپی آدرس", callback_data="copy_email"),
+                InlineKeyboardButton("📬 صندوق ورودی", callback_data="inbox"),
+            ],
+        ])
+        await status_msg.edit_text(success_msg, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
+
+
+async def show_inbox_callback(query, chat_id, session):
     await query.edit_message_text("⏳ در حال بررسی...")
     try:
         messages = await guerrilla_check(session["sid_token"])
@@ -592,7 +515,7 @@ async def show_inbox_from_callback(query, chat_id, session):
         await query.edit_message_text(f"❌ خطا: {str(e)}", reply_markup=build_main_menu_keyboard())
 
 
-async def show_email_detail_from_callback(query, detail):
+async def show_email_detail_callback(query, detail):
     sender = detail.get("sender", "ناشناس")
     subject = detail.get("subject", "(بدون موضوع)")
     text = detail.get("body", "")
@@ -601,8 +524,8 @@ async def show_email_detail_from_callback(query, detail):
     code = extract_verification_code(text)
     links = extract_link_context(text)
 
-    safe_sender = html_mod.escape(sender)
-    safe_subject = html_mod.escape(subject)
+    safe_sender = html_mod.escape(str(sender))
+    safe_subject = html_mod.escape(str(subject))
     safe_text = html_mod.escape(text[:2000])
 
     response = (
