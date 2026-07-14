@@ -116,6 +116,9 @@ async def tempmail_create():
 async def tempmail_check(token):
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.get(f"{TEMPMAIL}/v2/inbox", params={"token": token})
+        if r.status_code == 429:
+            logger.warning("tempmail.lol 429 rate limit hit")
+            return []
         r.raise_for_status()
         d = r.json()
         if d.get("expired"):
@@ -570,6 +573,11 @@ async def auto_check(ctx: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup(buttons),
                     )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                logger.warning("Rate limit hit for cid=%d, skipping", cid)
+            else:
+                logger.error("Auto-check HTTP error: %s", e)
         except Exception as e:
             logger.error("Auto-check error: %s", e)
 
@@ -815,7 +823,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CallbackQueryHandler(cb))
 
-    app.job_queue.run_repeating(auto_check, interval=10, first=5)
+    app.job_queue.run_repeating(auto_check, interval=30, first=5)
 
     logger.info("🚀 ربات شروع به کار کرد!")
     print("✅ ربات در حال اجراست...")
