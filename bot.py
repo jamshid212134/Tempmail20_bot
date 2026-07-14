@@ -371,7 +371,7 @@ async def auto_check_inbox(context: ContextTypes.DEFAULT_TYPE):
                 session["message_count"] = current_count
                 for m in new_messages:
                     sender = m.get("sender", "ناشناس")
-                    subject = m.get("subject", "(بدونوضوع)")
+                    subject = m.get("subject", "(بدون موضوع)")
                     detail = await guerrilla_fetch(session["sid_token"], m["id"])
                     text = detail.get("body", "")
                     code = extract_verification_code(text)
